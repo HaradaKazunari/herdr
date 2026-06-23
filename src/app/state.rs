@@ -1290,12 +1290,33 @@ pub(crate) const AUTOSEND_GRACE: Duration = Duration::from_secs(3);
 /// any user interaction, auto-send is disabled for that agent (circuit break).
 pub(crate) const AUTOSEND_MAX_STREAK: u8 = 5;
 
+/// Per-agent idle automation mode (default off = absent from the map). Cycled
+/// with `a` in the queues pane: Off → Insert → Send → Off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutosendMode {
+    /// On completion, insert the next prompt into the pane WITHOUT Enter; the
+    /// user reviews and submits. No runaway risk (nothing auto-submits).
+    Insert,
+    /// On completion, insert the next prompt AND press Enter (fully automatic).
+    /// Subject to the consecutive-send runaway guard.
+    Send,
+}
+
+impl AutosendMode {
+    /// Whether this mode submits with Enter (true for Send, false for Insert).
+    pub fn sends_enter(self) -> bool {
+        matches!(self, AutosendMode::Send)
+    }
+}
+
 /// A scheduled idle auto-send awaiting its grace deadline.
 #[derive(Debug, Clone, Copy)]
 pub struct PendingAutosend {
     pub ws_idx: usize,
     pub pane_id: PaneId,
     pub due: Instant,
+    /// Whether to press Enter on delivery (Send mode) or just insert (Insert).
+    pub send_enter: bool,
 }
 
 /// Active text entry in the queues pane: adding or editing a queued prompt.
@@ -1478,8 +1499,8 @@ pub struct AppState {
     /// Next-prompt queues, keyed by a stable agent id (agent_session, else cwd).
     /// Survives pane-id remap across restart/restore.
     pub agent_queues: std::collections::HashMap<String, std::collections::VecDeque<QueuedPrompt>>,
-    /// Stable agent ids with idle auto-send enabled. Default off (empty set).
-    pub agent_autosend: std::collections::HashSet<String>,
+    /// Idle automation mode per stable agent id. Absent = off (the default).
+    pub agent_autosend: std::collections::HashMap<String, AutosendMode>,
     /// Right-hand persistent agent-overview column: visibility and width.
     pub persistent_pane_visible: bool,
     pub persistent_pane_width: u16,
@@ -1611,22 +1632,31 @@ impl AppState {
             .push_front(QueuedPrompt { text });
     }
 
-    /// Toggle idle auto-send for an agent's queue. Returns the new enabled state.
-    /// Resets the runaway counter so a freshly (re)enabled agent starts clean.
-    pub fn toggle_autosend(&mut self, key: String) -> bool {
+    /// Cycle an agent's idle automation: Off → Insert → Send → Off. Returns the
+    /// new mode (None = off). Clears any in-flight send and the runaway counter
+    /// so a freshly (re)configured agent starts clean.
+    pub fn cycle_autosend(&mut self, key: String) -> Option<AutosendMode> {
         self.autosend_streak.remove(&key);
         self.pending_autosend.remove(&key);
-        if self.agent_autosend.remove(&key) {
-            false
-        } else {
-            self.agent_autosend.insert(key);
-            true
+        let next = match self.agent_autosend.get(&key) {
+            None => Some(AutosendMode::Insert),
+            Some(AutosendMode::Insert) => Some(AutosendMode::Send),
+            Some(AutosendMode::Send) => None,
+        };
+        match next {
+            Some(mode) => {
+                self.agent_autosend.insert(key, mode);
+            }
+            None => {
+                self.agent_autosend.remove(&key);
+            }
         }
+        next
     }
 
-    /// Whether idle auto-send is enabled for `key`.
-    pub fn autosend_enabled(&self, key: &str) -> bool {
-        self.agent_autosend.contains(key)
+    /// The agent's idle automation mode, or `None` when off.
+    pub fn autosend_mode(&self, key: &str) -> Option<AutosendMode> {
+        self.agent_autosend.get(key).copied()
     }
 
     /// Earliest pending auto-send deadline, so the loop can wake to fire it.
@@ -1642,11 +1672,12 @@ impl AppState {
             .retain(|_, pending| pending.pane_id != pane_id);
     }
 
-    /// Fire any idle auto-sends whose grace window has elapsed by `now`: pop the
-    /// head prompt and queue it for delivery (with Enter). Each fire bumps the
-    /// per-agent streak; reaching `AUTOSEND_MAX_STREAK` trips the circuit breaker
-    /// (auto-send is disabled for that agent until re-enabled). Returns whether
-    /// anything fired (so the caller can request a render).
+    /// Fire any idle automations whose grace window has elapsed by `now`: pop the
+    /// head prompt and queue it for delivery, pressing Enter only in Send mode
+    /// (Insert just stages the prompt). Each auto-SEND bumps the per-agent streak;
+    /// reaching `AUTOSEND_MAX_STREAK` trips the circuit breaker (disables it until
+    /// re-enabled). Auto-insert cannot loop, so it is not streak-limited. Returns
+    /// whether anything fired (so the caller can request a render).
     pub fn drain_due_autosend(&mut self, now: Instant) -> bool {
         let due: Vec<String> = self
             .pending_autosend
@@ -1663,12 +1694,14 @@ impl AppState {
                 continue;
             };
             self.request_queue_insert
-                .push((pending.ws_idx, pending.pane_id, text, true));
-            let streak = self.autosend_streak.entry(key.clone()).or_insert(0);
-            *streak = streak.saturating_add(1);
-            if *streak >= AUTOSEND_MAX_STREAK {
-                self.agent_autosend.remove(&key);
-                self.autosend_streak.remove(&key);
+                .push((pending.ws_idx, pending.pane_id, text, pending.send_enter));
+            if pending.send_enter {
+                let streak = self.autosend_streak.entry(key.clone()).or_insert(0);
+                *streak = streak.saturating_add(1);
+                if *streak >= AUTOSEND_MAX_STREAK {
+                    self.agent_autosend.remove(&key);
+                    self.autosend_streak.remove(&key);
+                }
             }
             fired = true;
         }
@@ -2018,9 +2051,9 @@ impl AppState {
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
             agent_queues: std::collections::HashMap::new(),
-            agent_autosend: std::collections::HashSet::new(),
+            agent_autosend: std::collections::HashMap::new(),
             persistent_pane_visible: true,
-            persistent_pane_width: 32,
+            persistent_pane_width: 40,
             persistent_pane_selected: 0,
             persistent_selected_agent: None,
             persistent_item_selected: None,
@@ -2392,11 +2425,12 @@ mod tests {
     }
 
     #[test]
-    fn autosend_drain_fires_only_due_entries_with_enter() {
+    fn autosend_drain_fires_only_due_entries_honoring_send_enter() {
         let mut state = AppState::test_new();
         let key = "session:auto".to_string();
         let pane = crate::layout::PaneId::from_raw(7);
         state.enqueue_prompt(key.clone(), "go".into());
+        state.enqueue_prompt(key.clone(), "next".into());
         let now = Instant::now();
 
         // Not yet due → nothing fires.
@@ -2406,26 +2440,45 @@ mod tests {
                 ws_idx: 0,
                 pane_id: pane,
                 due: now + Duration::from_secs(60),
+                send_enter: true,
             },
         );
         assert!(!state.drain_due_autosend(now));
         assert!(state.request_queue_insert.is_empty());
 
-        // Due → pops the head and queues it for delivery WITH Enter (send_enter=true).
+        // Auto-insert mode: due → stages the head WITHOUT Enter, no streak bump.
         state.pending_autosend.insert(
             key.clone(),
             PendingAutosend {
                 ws_idx: 0,
                 pane_id: pane,
                 due: now,
+                send_enter: false,
             },
         );
         assert!(state.drain_due_autosend(now));
         assert_eq!(
             state.request_queue_insert,
-            vec![(0, pane, "go".to_string(), true)]
+            vec![(0, pane, "go".to_string(), false)]
         );
-        assert!(state.pending_autosend.is_empty());
+        assert!(!state.autosend_streak.contains_key(&key));
+
+        // Auto-send mode: due → submits WITH Enter and bumps the streak.
+        state.request_queue_insert.clear();
+        state.pending_autosend.insert(
+            key.clone(),
+            PendingAutosend {
+                ws_idx: 0,
+                pane_id: pane,
+                due: now,
+                send_enter: true,
+            },
+        );
+        assert!(state.drain_due_autosend(now));
+        assert_eq!(
+            state.request_queue_insert,
+            vec![(0, pane, "next".to_string(), true)]
+        );
         assert_eq!(state.autosend_streak.get(&key).copied(), Some(1));
     }
 
@@ -2434,7 +2487,7 @@ mod tests {
         let mut state = AppState::test_new();
         let key = "session:loop".to_string();
         let pane = crate::layout::PaneId::from_raw(3);
-        state.agent_autosend.insert(key.clone());
+        state.agent_autosend.insert(key.clone(), AutosendMode::Send);
         state.enqueue_prompt(key.clone(), "x".into());
         // One auto-send away from the cap.
         state.autosend_streak.insert(key.clone(), AUTOSEND_MAX_STREAK - 1);
@@ -2445,11 +2498,12 @@ mod tests {
                 ws_idx: 0,
                 pane_id: pane,
                 due: now,
+                send_enter: true,
             },
         );
         assert!(state.drain_due_autosend(now));
         // Hitting the cap disables auto-send for the agent and clears the counter.
-        assert!(!state.autosend_enabled(&key));
+        assert!(state.autosend_mode(&key).is_none());
         assert!(!state.autosend_streak.contains_key(&key));
     }
 
@@ -2464,6 +2518,7 @@ mod tests {
                 ws_idx: 0,
                 pane_id: pane,
                 due: Instant::now(),
+                send_enter: true,
             },
         );
         // An unrelated pane's pending must be left intact.
@@ -2473,6 +2528,7 @@ mod tests {
                 ws_idx: 0,
                 pane_id: crate::layout::PaneId::from_raw(10),
                 due: Instant::now(),
+                send_enter: true,
             },
         );
         state.cancel_pending_autosend_for_pane(pane);
@@ -2481,7 +2537,7 @@ mod tests {
     }
 
     #[test]
-    fn toggle_autosend_clears_pending_and_streak() {
+    fn cycle_autosend_off_insert_send_off_and_clears_state() {
         let mut state = AppState::test_new();
         let key = "session:t".to_string();
         let pane = crate::layout::PaneId::from_raw(1);
@@ -2492,14 +2548,18 @@ mod tests {
                 ws_idx: 0,
                 pane_id: pane,
                 due: Instant::now(),
+                send_enter: true,
             },
         );
-        assert!(state.toggle_autosend(key.clone()));
-        assert!(state.autosend_enabled(&key));
+        // Off → Insert (and any in-flight send + streak is cleared).
+        assert_eq!(state.cycle_autosend(key.clone()), Some(AutosendMode::Insert));
+        assert_eq!(state.autosend_mode(&key), Some(AutosendMode::Insert));
         assert!(!state.autosend_streak.contains_key(&key));
         assert!(!state.pending_autosend.contains_key(&key));
-        assert!(!state.toggle_autosend(key.clone()));
-        assert!(!state.autosend_enabled(&key));
+        // Insert → Send → Off.
+        assert_eq!(state.cycle_autosend(key.clone()), Some(AutosendMode::Send));
+        assert_eq!(state.cycle_autosend(key.clone()), None);
+        assert!(state.autosend_mode(&key).is_none());
     }
 
     #[test]

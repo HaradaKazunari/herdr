@@ -2657,22 +2657,27 @@ impl AppState {
             self.cancel_pending_autosend_for_pane(pane_id);
         } else if change.previous_state == AgentState::Working && is_completion_transition(change) {
             let key = self.queue_key_for_pane(ws_idx, pane_id);
-            if self.agent_autosend.contains(&key) && self.queued_count(&key) > 0 {
-                if self.autosend_streak.get(&key).copied().unwrap_or(0)
-                    >= crate::app::state::AUTOSEND_MAX_STREAK
-                {
-                    // Too many consecutive auto-sends without user input → stop.
-                    self.agent_autosend.remove(&key);
-                    self.autosend_streak.remove(&key);
-                } else {
-                    self.pending_autosend.insert(
-                        key,
-                        crate::app::state::PendingAutosend {
-                            ws_idx,
-                            pane_id,
-                            due: std::time::Instant::now() + crate::app::state::AUTOSEND_GRACE,
-                        },
-                    );
+            if let Some(mode) = self.autosend_mode(&key) {
+                let send_enter = mode.sends_enter();
+                if self.queued_count(&key) > 0 {
+                    if send_enter
+                        && self.autosend_streak.get(&key).copied().unwrap_or(0)
+                            >= crate::app::state::AUTOSEND_MAX_STREAK
+                    {
+                        // Too many consecutive auto-sends without user input → stop.
+                        self.agent_autosend.remove(&key);
+                        self.autosend_streak.remove(&key);
+                    } else {
+                        self.pending_autosend.insert(
+                            key,
+                            crate::app::state::PendingAutosend {
+                                ws_idx,
+                                pane_id,
+                                due: std::time::Instant::now() + crate::app::state::AUTOSEND_GRACE,
+                                send_enter,
+                            },
+                        );
+                    }
                 }
             }
         }

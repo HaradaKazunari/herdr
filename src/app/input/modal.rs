@@ -723,10 +723,10 @@ pub(crate) fn handle_queues_key(state: &mut AppState, raw_key: TerminalKey) {
             });
         }
         KeyCode::Char(' ') => queues_send_to_agent(state, queue_key.as_deref(), None),
-        // Toggle idle auto-send for the selected agent (default off).
+        // Cycle idle automation for the selected agent: off → insert → send → off.
         KeyCode::Char('a') => {
             if let Some(key) = queue_key.clone() {
-                state.toggle_autosend(key);
+                state.cycle_autosend(key);
             }
         }
         KeyCode::Char('e') => {

@@ -175,12 +175,17 @@ pub(super) fn render_persistent_pane(
                     Style::default().fg(p.subtext0),
                 ));
             }
-            // Idle auto-send indicator (default off).
-            if app.autosend_enabled(&key) {
-                spans.push(Span::styled(
+            // Idle automation indicator (default off): insert-only vs auto-send.
+            match app.autosend_mode(&key) {
+                Some(crate::app::state::AutosendMode::Insert) => spans.push(Span::styled(
+                    " …insert",
+                    Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD),
+                )),
+                Some(crate::app::state::AutosendMode::Send) => spans.push(Span::styled(
                     " ⏵auto",
                     Style::default().fg(p.green).add_modifier(Modifier::BOLD),
-                ));
+                )),
+                None => {}
             }
             lines.push(Line::from(spans));
 
