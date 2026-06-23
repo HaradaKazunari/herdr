@@ -7,6 +7,7 @@ mod integrations;
 mod layouts;
 mod panes;
 pub(crate) mod plugins;
+mod queue;
 mod responses;
 mod tabs;
 mod workspaces;
@@ -98,6 +99,14 @@ impl App {
         if let AppEvent::WorktreeRemoveFinished(result) = ev {
             self.handle_worktree_remove_finished(*result);
             return;
+        }
+
+        // The resident note terminal is not part of the workspace tab tree, so
+        // handle (and respawn) its death before the normal pane-death path.
+        if let AppEvent::PaneDied { pane_id } = &ev {
+            if self.handle_note_terminal_died(*pane_id) {
+                return;
+            }
         }
 
         if let AppEvent::PaneDied { pane_id } = &ev {
@@ -852,6 +861,9 @@ impl App {
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentExplain(target) => return self.handle_agent_explain(request.id, target),
             Method::AgentSend(params) => return self.handle_agent_send(request.id, params),
+            Method::QueueAdd(params) => return self.handle_queue_add(request.id, params),
+            Method::QueueList(params) => return self.handle_queue_list(request.id, params),
+            Method::QueuePop(params) => return self.handle_queue_pop(request.id, params),
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
             Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),
             Method::PaneMove(params) => return self.handle_pane_move(request.id, params),

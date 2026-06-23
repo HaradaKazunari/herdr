@@ -6,6 +6,7 @@ use ratatui::style::Color;
 use crate::detect::AgentState;
 use crate::layout::{PaneId, PaneInfo, SplitBorder};
 use crate::selection::Selection;
+use std::time::{Duration, Instant};
 
 pub(crate) type InstalledPluginRegistry =
     std::collections::HashMap<String, crate::api::schema::InstalledPluginInfo>;
@@ -742,6 +743,13 @@ pub struct ViewState {
     pub toast_hit_area: Rect,
     pub pane_infos: Vec<PaneInfo>,
     pub split_borders: Vec<SplitBorder>,
+    /// Right-hand persistent agent-overview column (outside the tab tree).
+    /// Empty rect when hidden or in mobile layout. This is the lower (queues)
+    /// sub-section once the column is split with the note pane on top.
+    pub persistent_pane_rect: Rect,
+    /// Upper sub-section of the persistent column hosting the resident nvim
+    /// note pane. Empty rect when hidden or in mobile layout.
+    pub note_pane_rect: Rect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -766,6 +774,11 @@ pub enum Mode {
     GlobalMenu,
     KeybindHelp,
     Navigator,
+    /// Focus is on the right-hand queues pane (navigate agents with j/k).
+    Queues,
+    /// Focus is on the right-hand note pane; raw keys are forwarded to the
+    /// resident nvim editing `~/workspace/NOTES.md`.
+    Note,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1261,6 +1274,38 @@ pub(crate) struct PaneFocusTarget {
     pub pane_id: PaneId,
 }
 
+/// A prompt queued to be sent next to a specific agent (pane).
+/// Stored on `AppState`, keyed by a stable agent id so it survives pane-id
+/// remap across restart/restore.
+#[derive(Debug, Clone)]
+pub struct QueuedPrompt {
+    pub text: String,
+}
+
+/// Grace delay between an agent completing and an enabled idle auto-send
+/// actually firing — a window in which the agent resuming work (or being
+/// blocked) cancels the send, so a transient idle blip never auto-submits.
+pub(crate) const AUTOSEND_GRACE: Duration = Duration::from_secs(3);
+/// Runaway guard: after this many consecutive auto-sends to one agent without
+/// any user interaction, auto-send is disabled for that agent (circuit break).
+pub(crate) const AUTOSEND_MAX_STREAK: u8 = 5;
+
+/// A scheduled idle auto-send awaiting its grace deadline.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingAutosend {
+    pub ws_idx: usize,
+    pub pane_id: PaneId,
+    pub due: Instant,
+}
+
+/// Active text entry in the queues pane: adding or editing a queued prompt.
+#[derive(Debug, Clone)]
+pub struct QueueInputState {
+    pub buffer: String,
+    /// `Some(index)` edits the queued prompt at that index; `None` appends a new one.
+    pub editing: Option<usize>,
+}
+
 /// All application state — pure data, no channels or async runtime.
 /// Testable without PTYs or a tokio runtime.
 pub struct AppState {
@@ -1430,9 +1475,206 @@ pub struct AppState {
     /// Terminal runtimes that should be shut down by the app/runtime layer
     /// after state has detached their terminal metadata.
     pub(crate) terminal_runtime_shutdowns: Vec<crate::terminal::TerminalId>,
+    /// Next-prompt queues, keyed by a stable agent id (agent_session, else cwd).
+    /// Survives pane-id remap across restart/restore.
+    pub agent_queues: std::collections::HashMap<String, std::collections::VecDeque<QueuedPrompt>>,
+    /// Stable agent ids with idle auto-send enabled. Default off (empty set).
+    pub agent_autosend: std::collections::HashSet<String>,
+    /// Right-hand persistent agent-overview column: visibility and width.
+    pub persistent_pane_visible: bool,
+    pub persistent_pane_width: u16,
+    /// Selected agent index (display order) while focused in `Mode::Queues`.
+    /// Clamped to the live agent count at render time.
+    pub persistent_pane_selected: usize,
+    /// Resolved (ws_idx, pane_id) of the highlighted agent, set by the view
+    /// each frame so `Mode::Queues` input handlers can act on it.
+    pub persistent_selected_agent: Option<(usize, crate::layout::PaneId)>,
+    /// `Some(item)` browses the selected agent's queue items (ItemNav); `None`
+    /// browses agents (AgentNav).
+    pub persistent_item_selected: Option<usize>,
+    /// Active text entry (add/edit a prompt) in the queues pane, if any.
+    pub persistent_input: Option<QueueInputState>,
+    /// Prompts to dispatch into a pane's input, drained by the app/runtime layer
+    /// (which owns the PTY senders). Tuple = (ws_idx, pane_id, text, send_enter).
+    /// `send_enter=false` = manual insert (review then send); `true` = idle
+    /// auto-send (fire immediately). A Vec so several agents can dispatch at once.
+    pub request_queue_insert: Vec<(usize, crate::layout::PaneId, String, bool)>,
+    /// Registry id of the singleton, always-resident note terminal (an `nvim`
+    /// editing `~/workspace/NOTES.md`). `None` until spawned / after it dies.
+    /// It lives only in the `TerminalRuntimeRegistry`, outside the workspace
+    /// tab tree, so it is shared across every workspace and tab.
+    pub note_terminal_id: Option<crate::terminal::TerminalId>,
+    /// Stable synthetic pane id tagged onto the note terminal's PTY events
+    /// (notably `PaneDied`), so the app loop can recognise and respawn it.
+    pub note_pane_id: crate::layout::PaneId,
+    /// Set when the user explicitly focuses the note pane; drained by the app
+    /// loop to clear the crash-loop block and (re)spawn the note terminal, so a
+    /// transiently-broken note pane is always recoverable by re-focusing it.
+    pub request_ensure_note: bool,
+    /// Idle auto-sends scheduled but still within their grace window, keyed by
+    /// the agent's stable queue key. Drained by the app loop once due.
+    pub pending_autosend: std::collections::HashMap<String, PendingAutosend>,
+    /// Consecutive auto-sends per agent without user interaction, for the
+    /// runaway circuit breaker. Reset on any manual queue interaction.
+    pub autosend_streak: std::collections::HashMap<String, u8>,
 }
 
 impl AppState {
+    /// Stable queue key for a pane: the reported agent-session ref if present,
+    /// else the terminal cwd, else a pane fallback. Survives pane-id remap
+    /// across restart/restore (PaneId is reallocated on restore).
+    pub fn queue_key_for_pane(&self, ws_idx: usize, pane_id: crate::layout::PaneId) -> String {
+        if let Some(ws) = self.workspaces.get(ws_idx) {
+            if let Some(pane) = ws.pane_state(pane_id) {
+                if let Some(terminal) = self.terminals.get(&pane.attached_terminal_id) {
+                    if let Some(session) = &terminal.persisted_agent_session {
+                        return format!("session:{}", session.session_ref.value);
+                    }
+                    return format!("cwd:{}", terminal.cwd.display());
+                }
+            }
+        }
+        format!("pane:{ws_idx}:{}", pane_id.raw())
+    }
+
+    /// Append a prompt to an agent's next-prompt queue.
+    pub fn enqueue_prompt(&mut self, key: String, text: String) {
+        // Manual queue interaction resets the auto-send runaway counter, and the
+        // queue must be persisted so it survives a restart.
+        self.autosend_streak.remove(&key);
+        self.session_dirty = true;
+        self.agent_queues
+            .entry(key)
+            .or_default()
+            .push_back(QueuedPrompt { text });
+    }
+
+    /// Number of prompts queued for `key`.
+    pub fn queued_count(&self, key: &str) -> usize {
+        self.agent_queues.get(key).map_or(0, |queue| queue.len())
+    }
+
+    /// Texts of the prompts queued for `key`, front (next) first.
+    pub fn list_prompts(&self, key: &str) -> Vec<String> {
+        self.agent_queues
+            .get(key)
+            .map(|queue| queue.iter().map(|prompt| prompt.text.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Remove and return the front (next) prompt for `key`, if any.
+    pub fn pop_prompt(&mut self, key: &str) -> Option<String> {
+        let queue = self.agent_queues.get_mut(key)?;
+        let popped = queue.pop_front();
+        if queue.is_empty() {
+            self.agent_queues.remove(key);
+        }
+        if popped.is_some() {
+            self.session_dirty = true;
+        }
+        popped.map(|prompt| prompt.text)
+    }
+
+    /// Replace the text of the queued prompt at `index`. Returns false if absent.
+    pub fn edit_prompt(&mut self, key: &str, index: usize, text: String) -> bool {
+        match self.agent_queues.get_mut(key).and_then(|q| q.get_mut(index)) {
+            Some(prompt) => {
+                prompt.text = text;
+                self.session_dirty = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove the queued prompt at `index`, returning its text. Prunes empty queues.
+    pub fn remove_prompt(&mut self, key: &str, index: usize) -> Option<String> {
+        let queue = self.agent_queues.get_mut(key)?;
+        let removed = queue.remove(index).map(|prompt| prompt.text);
+        if queue.is_empty() {
+            self.agent_queues.remove(key);
+        }
+        if removed.is_some() {
+            self.autosend_streak.remove(key);
+            self.session_dirty = true;
+        }
+        removed
+    }
+
+    /// Put a prompt back at the front of an agent's queue (e.g. after a failed
+    /// delivery), so a popped prompt is never silently lost.
+    pub fn requeue_prompt_front(&mut self, key: String, text: String) {
+        self.session_dirty = true;
+        self.agent_queues
+            .entry(key)
+            .or_default()
+            .push_front(QueuedPrompt { text });
+    }
+
+    /// Toggle idle auto-send for an agent's queue. Returns the new enabled state.
+    /// Resets the runaway counter so a freshly (re)enabled agent starts clean.
+    pub fn toggle_autosend(&mut self, key: String) -> bool {
+        self.autosend_streak.remove(&key);
+        self.pending_autosend.remove(&key);
+        if self.agent_autosend.remove(&key) {
+            false
+        } else {
+            self.agent_autosend.insert(key);
+            true
+        }
+    }
+
+    /// Whether idle auto-send is enabled for `key`.
+    pub fn autosend_enabled(&self, key: &str) -> bool {
+        self.agent_autosend.contains(key)
+    }
+
+    /// Earliest pending auto-send deadline, so the loop can wake to fire it.
+    pub fn next_pending_autosend_deadline(&self) -> Option<Instant> {
+        self.pending_autosend.values().map(|p| p.due).min()
+    }
+
+    /// Cancel any scheduled auto-send for a pane, identified by its globally
+    /// unique pane id. Robust to the agent's queue key changing during the grace
+    /// window (and used when the pane dies), unlike removing by queue key.
+    pub fn cancel_pending_autosend_for_pane(&mut self, pane_id: crate::layout::PaneId) {
+        self.pending_autosend
+            .retain(|_, pending| pending.pane_id != pane_id);
+    }
+
+    /// Fire any idle auto-sends whose grace window has elapsed by `now`: pop the
+    /// head prompt and queue it for delivery (with Enter). Each fire bumps the
+    /// per-agent streak; reaching `AUTOSEND_MAX_STREAK` trips the circuit breaker
+    /// (auto-send is disabled for that agent until re-enabled). Returns whether
+    /// anything fired (so the caller can request a render).
+    pub fn drain_due_autosend(&mut self, now: Instant) -> bool {
+        let due: Vec<String> = self
+            .pending_autosend
+            .iter()
+            .filter(|(_, pending)| now >= pending.due)
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut fired = false;
+        for key in due {
+            let Some(pending) = self.pending_autosend.remove(&key) else {
+                continue;
+            };
+            let Some(text) = self.pop_prompt(&key) else {
+                continue;
+            };
+            self.request_queue_insert
+                .push((pending.ws_idx, pending.pane_id, text, true));
+            let streak = self.autosend_streak.entry(key.clone()).or_insert(0);
+            *streak = streak.saturating_add(1);
+            if *streak >= AUTOSEND_MAX_STREAK {
+                self.agent_autosend.remove(&key);
+                self.autosend_streak.remove(&key);
+            }
+            fired = true;
+        }
+        fired
+    }
+
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
     }
@@ -1682,6 +1924,8 @@ impl AppState {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
+                persistent_pane_rect: Rect::default(),
+                note_pane_rect: Rect::default(),
             },
             drag: None,
             workspace_press: None,
@@ -1773,6 +2017,20 @@ impl AppState {
             host_terminal_theme: TerminalTheme::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            agent_queues: std::collections::HashMap::new(),
+            agent_autosend: std::collections::HashSet::new(),
+            persistent_pane_visible: true,
+            persistent_pane_width: 32,
+            persistent_pane_selected: 0,
+            persistent_selected_agent: None,
+            persistent_item_selected: None,
+            persistent_input: None,
+            request_queue_insert: Vec::new(),
+            note_terminal_id: None,
+            note_pane_id: crate::layout::PaneId::alloc(),
+            request_ensure_note: false,
+            pending_autosend: std::collections::HashMap::new(),
+            autosend_streak: std::collections::HashMap::new(),
         }
     }
 
@@ -2112,6 +2370,178 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn next_prompt_queue_enqueue_list_pop() {
+        let mut state = AppState::test_new();
+        let key = "session:abc".to_string();
+        assert_eq!(state.queued_count(&key), 0);
+        state.enqueue_prompt(key.clone(), "first".into());
+        state.enqueue_prompt(key.clone(), "second".into());
+        assert_eq!(state.queued_count(&key), 2);
+        assert_eq!(
+            state.list_prompts(&key),
+            vec!["first".to_string(), "second".to_string()]
+        );
+        assert_eq!(state.pop_prompt(&key).as_deref(), Some("first"));
+        assert_eq!(state.list_prompts(&key), vec!["second".to_string()]);
+        assert_eq!(state.pop_prompt(&key).as_deref(), Some("second"));
+        assert_eq!(state.pop_prompt(&key), None);
+        // Draining the last item prunes the empty queue entry.
+        assert!(!state.agent_queues.contains_key(&key));
+    }
+
+    #[test]
+    fn autosend_drain_fires_only_due_entries_with_enter() {
+        let mut state = AppState::test_new();
+        let key = "session:auto".to_string();
+        let pane = crate::layout::PaneId::from_raw(7);
+        state.enqueue_prompt(key.clone(), "go".into());
+        let now = Instant::now();
+
+        // Not yet due → nothing fires.
+        state.pending_autosend.insert(
+            key.clone(),
+            PendingAutosend {
+                ws_idx: 0,
+                pane_id: pane,
+                due: now + Duration::from_secs(60),
+            },
+        );
+        assert!(!state.drain_due_autosend(now));
+        assert!(state.request_queue_insert.is_empty());
+
+        // Due → pops the head and queues it for delivery WITH Enter (send_enter=true).
+        state.pending_autosend.insert(
+            key.clone(),
+            PendingAutosend {
+                ws_idx: 0,
+                pane_id: pane,
+                due: now,
+            },
+        );
+        assert!(state.drain_due_autosend(now));
+        assert_eq!(
+            state.request_queue_insert,
+            vec![(0, pane, "go".to_string(), true)]
+        );
+        assert!(state.pending_autosend.is_empty());
+        assert_eq!(state.autosend_streak.get(&key).copied(), Some(1));
+    }
+
+    #[test]
+    fn autosend_streak_cap_trips_circuit_breaker() {
+        let mut state = AppState::test_new();
+        let key = "session:loop".to_string();
+        let pane = crate::layout::PaneId::from_raw(3);
+        state.agent_autosend.insert(key.clone());
+        state.enqueue_prompt(key.clone(), "x".into());
+        // One auto-send away from the cap.
+        state.autosend_streak.insert(key.clone(), AUTOSEND_MAX_STREAK - 1);
+        let now = Instant::now();
+        state.pending_autosend.insert(
+            key.clone(),
+            PendingAutosend {
+                ws_idx: 0,
+                pane_id: pane,
+                due: now,
+            },
+        );
+        assert!(state.drain_due_autosend(now));
+        // Hitting the cap disables auto-send for the agent and clears the counter.
+        assert!(!state.autosend_enabled(&key));
+        assert!(!state.autosend_streak.contains_key(&key));
+    }
+
+    #[test]
+    fn cancel_pending_autosend_matches_by_pane_identity_not_key() {
+        let mut state = AppState::test_new();
+        let pane = crate::layout::PaneId::from_raw(9);
+        // Scheduled under one key; a later key for the same pane may differ.
+        state.pending_autosend.insert(
+            "cwd:/tmp".to_string(),
+            PendingAutosend {
+                ws_idx: 0,
+                pane_id: pane,
+                due: Instant::now(),
+            },
+        );
+        // An unrelated pane's pending must be left intact.
+        state.pending_autosend.insert(
+            "session:other".to_string(),
+            PendingAutosend {
+                ws_idx: 0,
+                pane_id: crate::layout::PaneId::from_raw(10),
+                due: Instant::now(),
+            },
+        );
+        state.cancel_pending_autosend_for_pane(pane);
+        assert!(!state.pending_autosend.contains_key("cwd:/tmp"));
+        assert!(state.pending_autosend.contains_key("session:other"));
+    }
+
+    #[test]
+    fn toggle_autosend_clears_pending_and_streak() {
+        let mut state = AppState::test_new();
+        let key = "session:t".to_string();
+        let pane = crate::layout::PaneId::from_raw(1);
+        state.autosend_streak.insert(key.clone(), 2);
+        state.pending_autosend.insert(
+            key.clone(),
+            PendingAutosend {
+                ws_idx: 0,
+                pane_id: pane,
+                due: Instant::now(),
+            },
+        );
+        assert!(state.toggle_autosend(key.clone()));
+        assert!(state.autosend_enabled(&key));
+        assert!(!state.autosend_streak.contains_key(&key));
+        assert!(!state.pending_autosend.contains_key(&key));
+        assert!(!state.toggle_autosend(key.clone()));
+        assert!(!state.autosend_enabled(&key));
+    }
+
+    #[test]
+    fn edit_and_remove_prompt() {
+        let mut state = AppState::test_new();
+        let key = "k".to_string();
+        for t in ["a", "b", "c"] {
+            state.enqueue_prompt(key.clone(), t.to_string());
+        }
+        assert!(state.edit_prompt(&key, 1, "B".to_string()));
+        assert_eq!(
+            state.list_prompts(&key),
+            vec!["a".to_string(), "B".to_string(), "c".to_string()]
+        );
+        // Out-of-range edit / remove are no-ops.
+        assert!(!state.edit_prompt(&key, 9, "x".to_string()));
+        assert_eq!(state.remove_prompt(&key, 5), None);
+        // Remove from the middle, then drain; the empty queue is pruned.
+        assert_eq!(state.remove_prompt(&key, 1).as_deref(), Some("B"));
+        assert_eq!(state.list_prompts(&key), vec!["a".to_string(), "c".to_string()]);
+        state.remove_prompt(&key, 0);
+        state.remove_prompt(&key, 0);
+        assert!(!state.agent_queues.contains_key(&key));
+    }
+
+    #[test]
+    fn queue_key_uses_cwd_then_pane_fallback() {
+        let mut state = AppState::test_new();
+        let ws = crate::workspace::Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let terminal_id = ws.tabs[0].panes[&pane_id].attached_terminal_id.clone();
+        state.terminals.insert(
+            terminal_id.clone(),
+            crate::terminal::TerminalState::new(terminal_id, std::path::PathBuf::from("/tmp/proj")),
+        );
+        state.workspaces.push(ws);
+        assert_eq!(state.queue_key_for_pane(0, pane_id), "cwd:/tmp/proj");
+        // Unknown workspace index falls back to a pane-derived key without panicking.
+        assert!(state
+            .queue_key_for_pane(9, pane_id)
+            .starts_with("pane:9:"));
+    }
 
     #[test]
     fn agent_terminal_keeps_final_child_cursor_exposed() {

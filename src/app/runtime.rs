@@ -199,6 +199,10 @@ impl App {
         let mut changed = false;
         let mut resized = false;
 
+        if self.state.drain_due_autosend(now) {
+            changed = true;
+        }
+
         self.sync_animation_timer(now);
 
         if now >= self.next_resize_poll {
@@ -566,6 +570,7 @@ impl App {
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
             self.selection_highlight_clear_deadline,
+            self.state.next_pending_autosend_deadline(),
             render_deadline,
         ]
         .into_iter()

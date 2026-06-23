@@ -46,8 +46,8 @@ mod terminal;
 pub(crate) use self::{
     modal::{
         handle_confirm_close_key, handle_context_menu_key, handle_global_menu_key,
-        handle_keybind_help_key, handle_navigator_key, handle_rename_key, handle_resize_key,
-        insert_navigator_search_text, insert_rename_input_text,
+        handle_keybind_help_key, handle_navigator_key, handle_queues_key, handle_rename_key,
+        handle_resize_key, insert_navigator_search_text, insert_rename_input_text,
     },
     navigate::terminal_direct_navigation_action,
     settings::open_settings_at,
@@ -92,6 +92,8 @@ impl App {
                 Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
                 Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
                 Mode::Resize => handle_resize_key(&mut self.state, key),
+                Mode::Queues => handle_queues_key(&mut self.state, key),
+                Mode::Note => self.handle_note_key(key),
                 Mode::ConfirmClose => handle_confirm_close_key(&mut self.state, key_event),
                 Mode::ContextMenu => {
                     handle_context_menu_key(
@@ -593,6 +595,7 @@ fn capture_snapshot(state: &AppState) -> crate::persist::SessionSnapshot {
         state.sidebar_width,
         state.sidebar_section_split,
         state.collapsed_space_keys.clone(),
+        std::collections::HashMap::new(),
     )
 }
 

@@ -26,6 +26,10 @@ pub struct SessionSnapshot {
     pub sidebar_section_split: Option<f32>,
     #[serde(default)]
     pub collapsed_space_keys: std::collections::HashSet<String>,
+    /// Per-agent next-prompt queues (stable queue key → ordered prompt texts),
+    /// so queued prompts survive a restart.
+    #[serde(default)]
+    pub agent_queues: std::collections::HashMap<String, Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -182,6 +186,8 @@ struct RawSessionSnapshot {
     sidebar_section_split: Option<f32>,
     #[serde(default)]
     collapsed_space_keys: std::collections::HashSet<String>,
+    #[serde(default)]
+    agent_queues: std::collections::HashMap<String, Vec<String>>,
 }
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
@@ -197,6 +203,7 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         sidebar_width: raw.sidebar_width,
         sidebar_section_split: raw.sidebar_section_split,
         collapsed_space_keys: raw.collapsed_space_keys,
+        agent_queues: raw.agent_queues,
     })
 }
 
@@ -259,6 +266,7 @@ pub fn capture(
     sidebar_width: u16,
     sidebar_section_split: f32,
     collapsed_space_keys: std::collections::HashSet<String>,
+    agent_queues: std::collections::HashMap<String, Vec<String>>,
 ) -> SessionSnapshot {
     SessionSnapshot {
         version: SNAPSHOT_VERSION,
@@ -271,6 +279,7 @@ pub fn capture(
         sidebar_width: Some(sidebar_width),
         sidebar_section_split: Some(sidebar_section_split),
         collapsed_space_keys,
+        agent_queues,
     }
 }
 
@@ -539,6 +548,7 @@ mod tests {
             state.sidebar_width,
             state.sidebar_section_split,
             state.collapsed_space_keys.clone(),
+            std::collections::HashMap::new(),
         )
     }
 
@@ -566,6 +576,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            agent_queues: std::collections::HashMap::new(),
         };
         let json = serde_json::to_string(&snap).unwrap();
         let restored = parse_snapshot(&json).unwrap();
@@ -652,6 +663,7 @@ mod tests {
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
             version: SNAPSHOT_VERSION,
+            agent_queues: std::collections::HashMap::new(),
         };
 
         let json = serde_json::to_string_pretty(&snap).unwrap();
@@ -1206,6 +1218,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            agent_queues: std::collections::HashMap::new(),
         };
 
         let json = serde_json::to_string(&snap).unwrap();

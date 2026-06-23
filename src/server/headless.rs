@@ -440,6 +440,9 @@ impl HeadlessServer {
         // We use None for input_rx so the event loop doesn't try to read from stdin.
         self.app.input_rx = None;
 
+        // Spawn the always-resident note pane (nvim) for the server runtime.
+        self.app.ensure_note_terminal();
+
         let mut needs_render = true;
         let mut needs_full_render = true;
 
@@ -555,6 +558,33 @@ impl HeadlessServer {
                 needs_render = true;
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
+            }
+
+            self.app.drain_note_ensure_request();
+
+            // Queues pane: insert a queued prompt into the target agent's input
+            // (no Enter); bracketed paste keeps newlines literal. Re-queue on
+            // failure so a popped prompt is never lost.
+            for (ws_idx, pane_id, text, send_enter) in
+                std::mem::take(&mut self.app.state.request_queue_insert)
+            {
+                let sent = self
+                    .app
+                    .state
+                    .runtime_for_pane_in_workspace(&self.app.terminal_runtimes, ws_idx, pane_id)
+                    .map(|runtime| {
+                        let mut encoded = crate::app::api_helpers::encode_api_text(runtime, &text);
+                        if send_enter {
+                            encoded.push(b'\r');
+                        }
+                        runtime.try_send_bytes(Bytes::from(encoded)).is_ok()
+                    })
+                    .unwrap_or(false);
+                if !sent {
+                    let key = self.app.state.queue_key_for_pane(ws_idx, pane_id);
+                    self.app.state.requeue_prompt_front(key, text);
+                }
+                needs_render = true;
             }
 
             if self.app.state.request_submit_worktree_create {
@@ -859,6 +889,21 @@ impl HeadlessServer {
             }
         }
 
+        let agent_queues = self
+            .app
+            .state
+            .agent_queues
+            .iter()
+            // Only persist stable keys (session:/cwd:); pane:-fallback keys never
+            // re-bind after a handoff/restart, so persisting them would leak.
+            .filter(|(key, _)| !key.starts_with("pane:"))
+            .map(|(key, queue)| {
+                (
+                    key.clone(),
+                    queue.iter().map(|prompt| prompt.text.clone()).collect(),
+                )
+            })
+            .collect();
         let snapshot = crate::persist::capture(
             &self.app.state.workspaces,
             &self.app.state.terminals,
@@ -868,6 +913,7 @@ impl HeadlessServer {
             self.app.state.sidebar_width,
             self.app.state.sidebar_section_split,
             self.app.state.collapsed_space_keys.clone(),
+            agent_queues,
         );
 
         let mut handoff_entries = Vec::new();
@@ -3333,6 +3379,10 @@ impl HeadlessServer {
     /// (the server doesn't have a terminal to resize).
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
+
+        if self.app.state.drain_due_autosend(now) {
+            changed = true;
+        }
 
         self.app.sync_headless_animation_timer(now);
 

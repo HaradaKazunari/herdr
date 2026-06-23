@@ -5,7 +5,8 @@ use serde::Serialize;
 use crate::api::client::{ApiClient, ApiClientError};
 use crate::api::schema::{
     AgentStatus, ClientWindowTitleSetParams, EmptyParams, Method, OutputMatch, PaneAgentState,
-    PaneWaitForOutputParams, ReadFormat, ReadSource, Request, SplitDirection, Subscription,
+    PaneWaitForOutputParams, QueueAddParams, QueueTargetParams, ReadFormat, ReadSource, Request,
+    SplitDirection, Subscription,
 };
 
 mod agent;
@@ -63,6 +64,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "wait" => run_wait_command(&args[2..])?,
         "integration" => integration::run_integration_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
+        "queue" => run_queue_command(&args[2..])?,
         _ => return Ok(CommandOutcome::NotCli),
     };
 
@@ -741,6 +743,52 @@ pub(super) fn send_ok_request(method: Method) -> std::io::Result<i32> {
     }
 
     Ok(0)
+}
+
+fn run_queue_command(args: &[String]) -> std::io::Result<i32> {
+    match args.first().map(|arg| arg.as_str()) {
+        Some("add") => {
+            if args.len() != 3 {
+                eprintln!("usage: herdr queue add <target> <text>");
+                return Ok(2);
+            }
+            print_response(&send_request(&Request {
+                id: "cli:queue:add".into(),
+                method: Method::QueueAdd(QueueAddParams {
+                    target: args[1].clone(),
+                    text: args[2].clone(),
+                }),
+            })?)
+        }
+        Some("list") => {
+            if args.len() != 2 {
+                eprintln!("usage: herdr queue list <target>");
+                return Ok(2);
+            }
+            print_response(&send_request(&Request {
+                id: "cli:queue:list".into(),
+                method: Method::QueueList(QueueTargetParams {
+                    target: args[1].clone(),
+                }),
+            })?)
+        }
+        Some("pop") => {
+            if args.len() != 2 {
+                eprintln!("usage: herdr queue pop <target>");
+                return Ok(2);
+            }
+            print_response(&send_request(&Request {
+                id: "cli:queue:pop".into(),
+                method: Method::QueuePop(QueueTargetParams {
+                    target: args[1].clone(),
+                }),
+            })?)
+        }
+        _ => {
+            eprintln!("usage: herdr queue <add|list|pop> <target> [text]");
+            Ok(2)
+        }
+    }
 }
 
 pub(super) fn send_request(request: &Request) -> std::io::Result<serde_json::Value> {

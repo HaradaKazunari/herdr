@@ -128,6 +128,26 @@ impl App {
         true
     }
 
+    /// `Mode::Note`: forward raw keys to the resident note terminal's PTY (nvim).
+    /// The prefix key is the escape hatch back out, like any other pane — every
+    /// other key (including `Esc`, which nvim needs) goes straight to nvim.
+    pub(crate) fn handle_note_key(&mut self, key: TerminalKey) {
+        if self.state.is_prefix_key(key) {
+            self.state.mode = Mode::Prefix;
+            return;
+        }
+        let Some(id) = self.state.note_terminal_id.clone() else {
+            return;
+        };
+        let Some(rt) = self.terminal_runtimes.get(&id) else {
+            return;
+        };
+        let bytes = rt.encode_terminal_key(key);
+        if !bytes.is_empty() {
+            let _ = rt.try_send_bytes(Bytes::from(bytes));
+        }
+    }
+
     pub(super) fn launch_custom_command(
         &mut self,
         binding: crate::config::CustomCommandKeybind,
@@ -603,6 +623,9 @@ pub(crate) enum NavigateAction {
     Zoom,
     EnterResizeMode,
     ToggleSidebar,
+    ToggleQueuesPane,
+    FocusQueuesPane,
+    FocusNotePane,
     CyclePaneNext,
     CyclePanePrevious,
     LastPane,
@@ -710,6 +733,9 @@ fn action_for_key(
         (&kb.zoom, NavigateAction::Zoom),
         (&kb.resize_mode, NavigateAction::EnterResizeMode),
         (&kb.toggle_sidebar, NavigateAction::ToggleSidebar),
+        (&kb.toggle_queues_pane, NavigateAction::ToggleQueuesPane),
+        (&kb.focus_queues_pane, NavigateAction::FocusQueuesPane),
+        (&kb.focus_note_pane, NavigateAction::FocusNotePane),
         (&kb.reload_config, NavigateAction::ReloadConfig),
         (
             &kb.open_notification_target,
@@ -917,6 +943,25 @@ pub(super) fn execute_navigate_action_in_context(
         NavigateAction::ToggleSidebar => {
             state.sidebar_collapsed = !state.sidebar_collapsed;
             leave_navigate_mode(state);
+        }
+        NavigateAction::ToggleQueuesPane => {
+            state.persistent_pane_visible = !state.persistent_pane_visible;
+            leave_navigate_mode(state);
+        }
+        NavigateAction::FocusQueuesPane => {
+            state.persistent_pane_visible = true;
+            state.persistent_pane_selected = 0;
+            state.persistent_selected_agent = None;
+            state.persistent_item_selected = None;
+            state.persistent_input = None;
+            state.mode = Mode::Queues;
+        }
+        NavigateAction::FocusNotePane => {
+            state.persistent_pane_visible = true;
+            // Re-focusing always re-attempts a spawn (and clears any crash-loop
+            // block) so a transiently-broken note pane is user-recoverable.
+            state.request_ensure_note = true;
+            state.mode = Mode::Note;
         }
         NavigateAction::CyclePaneNext => {
             state.cycle_pane(false);

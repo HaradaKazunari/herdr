@@ -2644,6 +2644,39 @@ impl AppState {
             self.apply_agent_notification_delivery(&delivery);
         }
 
+        // idle auto-send (guarded): on a genuine Working→Idle completion, when
+        // enabled and there is a queued prompt, schedule a grace-delayed send;
+        // the moment the agent leaves idle again (resumes work or is blocked) the
+        // pending send is cancelled. Blocked→Idle never schedules (previous_state
+        // must be Working). A per-agent streak cap trips a circuit breaker against
+        // runaway loops. The grace timer fires in AppState::drain_due_autosend.
+        if change.state != AgentState::Idle {
+            // Cancel by pane identity, not by the (recomputable, mutable) queue
+            // key: the key can shift within the grace window (session ref
+            // appearing/rotating), which would otherwise strand a pending send.
+            self.cancel_pending_autosend_for_pane(pane_id);
+        } else if change.previous_state == AgentState::Working && is_completion_transition(change) {
+            let key = self.queue_key_for_pane(ws_idx, pane_id);
+            if self.agent_autosend.contains(&key) && self.queued_count(&key) > 0 {
+                if self.autosend_streak.get(&key).copied().unwrap_or(0)
+                    >= crate::app::state::AUTOSEND_MAX_STREAK
+                {
+                    // Too many consecutive auto-sends without user input → stop.
+                    self.agent_autosend.remove(&key);
+                    self.autosend_streak.remove(&key);
+                } else {
+                    self.pending_autosend.insert(
+                        key,
+                        crate::app::state::PendingAutosend {
+                            ws_idx,
+                            pane_id,
+                            due: std::time::Instant::now() + crate::app::state::AUTOSEND_GRACE,
+                        },
+                    );
+                }
+            }
+        }
+
         Some(seen)
     }
 
@@ -2844,6 +2877,9 @@ impl AppState {
 
     fn handle_pane_died(&mut self, pane_id: PaneId) {
         self.pending_agent_notifications.remove(&pane_id);
+        // Drop any auto-send scheduled for this pane (e.g. from the synthetic
+        // process-exit completion) so it never fires into the dead pane.
+        self.cancel_pending_autosend_for_pane(pane_id);
         self.plugin_panes.remove(&pane_id);
         let ws_idx = self
             .workspaces

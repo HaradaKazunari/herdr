@@ -4,6 +4,7 @@ use ratatui::layout::{Direction, Rect};
 use crate::{
     app::state::{
         AppState, ContextMenuKind, ContextMenuState, MenuListState, Mode, NavigatorStateFilter,
+        QueueInputState,
     },
     input::TerminalKey,
     layout::NavDirection,
@@ -639,6 +640,177 @@ pub(crate) fn handle_resize_key(state: &mut AppState, raw_key: TerminalKey) {
     }
 }
 
+/// Input while focused on the queues pane (`Mode::Queues`). Three sub-states:
+/// - text entry active (`persistent_input`): type a prompt; `Enter` commits
+///   (add or edit), `Esc` cancels.
+/// - ItemNav (`persistent_item_selected`): `j`/`k` move among the agent's queue
+///   items; `Enter` edits the selected item, `d` deletes it, `Esc` goes back.
+/// - AgentNav (default): `j`/`k` move among agents; `Enter` adds a prompt, `e`
+///   drills into the agent's queue items, `Esc`/`q`/focus-key leave the mode.
+pub(crate) fn handle_queues_key(state: &mut AppState, raw_key: TerminalKey) {
+    let key = raw_key.as_key_event();
+
+    // Sub-state 1: a text-entry buffer is open.
+    if state.persistent_input.is_some() {
+        handle_queues_input_key(state, key);
+        return;
+    }
+
+    // The focused agent's queue key (None when there are no agents).
+    let queue_key = state
+        .persistent_selected_agent
+        .map(|(ws_idx, pane_id)| state.queue_key_for_pane(ws_idx, pane_id));
+
+    // Sub-state 2: browsing a specific agent's queue items (ItemNav).
+    if let Some(item) = state.persistent_item_selected {
+        let item_count = queue_key
+            .as_deref()
+            .map(|k| state.list_prompts(k).len())
+            .unwrap_or(0);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => state.persistent_item_selected = None,
+            KeyCode::Char('j') | KeyCode::Down if item_count > 0 => {
+                state.persistent_item_selected = Some((item + 1).min(item_count - 1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                state.persistent_item_selected = Some(item.saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                if let Some(text) = queue_key
+                    .as_deref()
+                    .and_then(|k| state.list_prompts(k).into_iter().nth(item))
+                {
+                    state.persistent_input = Some(QueueInputState {
+                        buffer: text,
+                        editing: Some(item),
+                    });
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(k) = queue_key.as_deref() {
+                    state.remove_prompt(k, item);
+                    let remaining = state.list_prompts(k).len();
+                    state.persistent_item_selected =
+                        (remaining > 0).then(|| item.min(remaining - 1));
+                }
+            }
+            KeyCode::Char(' ') => queues_send_to_agent(state, queue_key.as_deref(), Some(item)),
+            _ => {}
+        }
+        return;
+    }
+
+    // Sub-state 3: browsing agents (AgentNav, default).
+    if key.code == KeyCode::Esc
+        || key.code == KeyCode::Char('q')
+        || state.keybinds.focus_queues_pane.matches_prefix_key(raw_key)
+        || state.keybinds.focus_queues_pane.matches_direct_key(raw_key)
+    {
+        leave_queues_mode(state);
+        return;
+    }
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            state.persistent_pane_selected = state.persistent_pane_selected.saturating_add(1);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            state.persistent_pane_selected = state.persistent_pane_selected.saturating_sub(1);
+        }
+        KeyCode::Enter if queue_key.is_some() => {
+            state.persistent_input = Some(QueueInputState {
+                buffer: String::new(),
+                editing: None,
+            });
+        }
+        KeyCode::Char(' ') => queues_send_to_agent(state, queue_key.as_deref(), None),
+        // Toggle idle auto-send for the selected agent (default off).
+        KeyCode::Char('a') => {
+            if let Some(key) = queue_key.clone() {
+                state.toggle_autosend(key);
+            }
+        }
+        KeyCode::Char('e') => {
+            if queue_key
+                .as_deref()
+                .is_some_and(|k| !state.list_prompts(k).is_empty())
+            {
+                state.persistent_item_selected = Some(0);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Text entry for adding or editing a queued prompt.
+fn handle_queues_input_key(state: &mut AppState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => state.persistent_input = None,
+        KeyCode::Enter => {
+            if let Some(input) = state.persistent_input.take() {
+                let text = input.buffer.trim().to_string();
+                if let (false, Some((ws_idx, pane_id))) =
+                    (text.is_empty(), state.persistent_selected_agent)
+                {
+                    let key = state.queue_key_for_pane(ws_idx, pane_id);
+                    match input.editing {
+                        Some(index) => {
+                            state.edit_prompt(&key, index, text);
+                        }
+                        None => state.enqueue_prompt(key, text),
+                    }
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(input) = state.persistent_input.as_mut() {
+                input.buffer.pop();
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Some(input) = state.persistent_input.as_mut() {
+                input.buffer.push(c);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Leave `Mode::Queues`, clearing transient sub-state.
+fn leave_queues_mode(state: &mut AppState) {
+    state.persistent_item_selected = None;
+    state.persistent_input = None;
+    state.persistent_selected_agent = None;
+    state.mode = if state.active.is_some() {
+        Mode::Terminal
+    } else {
+        Mode::Navigate
+    };
+}
+
+/// Send a queued prompt to the selected agent: pop it (head when `index` is
+/// `None`, else the item at `index`), focus that agent's pane, and request the
+/// app layer to insert the text (no Enter) so the user reviews and sends it.
+fn queues_send_to_agent(state: &mut AppState, queue_key: Option<&str>, index: Option<usize>) {
+    let (Some((ws_idx, pane_id)), Some(key)) = (state.persistent_selected_agent, queue_key) else {
+        return;
+    };
+    // Manual send is user attention: cancel any pending auto-send and reset the
+    // runaway counter for this agent.
+    state.pending_autosend.remove(key);
+    state.autosend_streak.remove(key);
+    let text = match index {
+        Some(i) => state.remove_prompt(key, i),
+        None => state.pop_prompt(key),
+    };
+    if let Some(text) = text {
+        state.focus_pane_in_workspace(ws_idx, pane_id);
+        // Manual Space-send: insert into the pane input without Enter so the
+        // user reviews and submits it themselves (send_enter = false).
+        state.request_queue_insert.push((ws_idx, pane_id, text, false));
+        leave_queues_mode(state);
+    }
+}
+
 pub(super) fn open_confirm_close(state: &mut AppState) {
     state.mode = Mode::ConfirmClose;
 }
@@ -922,6 +1094,107 @@ mod tests {
 
     fn config_env_lock() -> &'static std::sync::Mutex<()> {
         crate::config::test_config_env_lock()
+    }
+
+    fn enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn queues_full_flow_enter_opens_input_then_types_and_commits() {
+        let mut state = AppState::test_new();
+        state.mode = Mode::Queues;
+        let pane = crate::layout::PaneId::from_raw(1);
+        state.persistent_selected_agent = Some((0, pane));
+        let key = state.queue_key_for_pane(0, pane);
+
+        // Enter (AgentNav) opens the add-input buffer.
+        handle_queues_key(&mut state, TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(state.persistent_input.is_some(), "Enter should open the input");
+
+        // Subsequent keys are routed to the input buffer, not agent navigation.
+        for c in ['h', 'i'] {
+            handle_queues_key(
+                &mut state,
+                TerminalKey::new(KeyCode::Char(c), KeyModifiers::empty()),
+            );
+        }
+        assert_eq!(
+            state.persistent_input.as_ref().map(|i| i.buffer.as_str()),
+            Some("hi")
+        );
+
+        // Enter commits.
+        handle_queues_key(&mut state, TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(state.persistent_input.is_none());
+        assert_eq!(state.list_prompts(&key), vec!["hi".to_string()]);
+    }
+
+    #[test]
+    fn queues_space_sends_head_to_agent_and_leaves_mode() {
+        let mut state = AppState::test_new();
+        state.mode = Mode::Queues;
+        let pane = crate::layout::PaneId::from_raw(1);
+        state.persistent_selected_agent = Some((0, pane));
+        let key = state.queue_key_for_pane(0, pane);
+        state.enqueue_prompt(key.clone(), "do it".to_string());
+
+        handle_queues_key(
+            &mut state,
+            TerminalKey::new(KeyCode::Char(' '), KeyModifiers::empty()),
+        );
+
+        // The head is popped, queued for insertion into the pane, and the mode left.
+        assert!(state.list_prompts(&key).is_empty());
+        assert_eq!(
+            state.request_queue_insert,
+            vec![(0, pane, "do it".to_string(), false)]
+        );
+        assert_ne!(state.mode, Mode::Queues);
+    }
+
+    #[test]
+    fn queues_input_commits_add_edits_and_cancels() {
+        let mut state = AppState::test_new();
+        // No workspace exists, so the queue key falls back to "pane:0:1".
+        let pane = crate::layout::PaneId::from_raw(1);
+        state.persistent_selected_agent = Some((0, pane));
+        let key = state.queue_key_for_pane(0, pane);
+
+        // Add: type "hi", Enter commits and closes the input.
+        state.persistent_input = Some(QueueInputState {
+            buffer: String::new(),
+            editing: None,
+        });
+        for c in ['h', 'i'] {
+            handle_queues_input_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()),
+            );
+        }
+        handle_queues_input_key(&mut state, enter());
+        assert!(state.persistent_input.is_none());
+        assert_eq!(state.list_prompts(&key), vec!["hi".to_string()]);
+
+        // Edit item 0 in place.
+        state.persistent_input = Some(QueueInputState {
+            buffer: "HX".to_string(),
+            editing: Some(0),
+        });
+        handle_queues_input_key(&mut state, enter());
+        assert_eq!(state.list_prompts(&key), vec!["HX".to_string()]);
+
+        // Esc cancels without committing; an empty buffer commits nothing.
+        state.persistent_input = Some(QueueInputState {
+            buffer: "zz".to_string(),
+            editing: None,
+        });
+        handle_queues_input_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        );
+        assert!(state.persistent_input.is_none());
+        assert_eq!(state.list_prompts(&key), vec!["HX".to_string()]);
     }
 
     fn temp_config_path(name: &str) -> std::path::PathBuf {

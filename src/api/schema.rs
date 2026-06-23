@@ -6,6 +6,7 @@ pub mod events;
 pub mod integrations;
 pub mod panes;
 pub mod plugins;
+pub mod queue;
 pub mod response;
 pub mod server;
 pub mod tabs;
@@ -18,6 +19,7 @@ pub use events::*;
 pub use integrations::*;
 pub use panes::*;
 pub use plugins::*;
+pub use queue::*;
 pub use response::*;
 pub use server::*;
 pub use tabs::*;
@@ -191,6 +193,12 @@ pub enum Method {
     PluginPaneFocus(PluginPaneFocusParams),
     #[serde(rename = "plugin.pane.close")]
     PluginPaneClose(PluginPaneCloseParams),
+    #[serde(rename = "queue.add")]
+    QueueAdd(QueueAddParams),
+    #[serde(rename = "queue.list")]
+    QueueList(QueueTargetParams),
+    #[serde(rename = "queue.pop")]
+    QueuePop(QueueTargetParams),
 }
 
 #[cfg(test)]

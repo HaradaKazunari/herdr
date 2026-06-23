@@ -397,6 +397,14 @@ pub struct KeysConfig {
     pub resize_mode: BindingConfig,
     /// Toggle sidebar collapse. Default: "prefix+b"
     pub toggle_sidebar: BindingConfig,
+    /// Toggle the queues pane. Default: "prefix+u" (temporary; "prefix+o" is
+    /// taken by open_notification_target). Rebindable via `[keys]`.
+    pub toggle_queues_pane: BindingConfig,
+    /// Focus the queues pane to navigate agents. Default: "prefix+shift+q".
+    pub focus_queues_pane: BindingConfig,
+    /// Focus the resident note pane (nvim on ~/workspace/NOTES.md); keys are
+    /// forwarded to nvim, the prefix key exits. Default: "prefix+shift+e".
+    pub focus_note_pane: BindingConfig,
     /// Optional indexed shortcuts expanded over number keys 1-9.
     pub indexed: IndexedKeysConfig,
     /// Prefix-mode custom command bindings.
@@ -516,6 +524,12 @@ pub(crate) struct KeysConfigOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     toggle_sidebar: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    toggle_queues_pane: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focus_queues_pane: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focus_note_pane: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     indexed: Option<IndexedKeysConfig>,
     #[serde(skip_serializing)]
     command: Option<Vec<CommandKeybindConfig>>,
@@ -591,6 +605,9 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(zoom);
         apply_field!(resize_mode);
         apply_field!(toggle_sidebar);
+        apply_field!(toggle_queues_pane);
+        apply_field!(focus_queues_pane);
+        apply_field!(focus_note_pane);
         apply_field!(indexed);
         apply_field!(command);
 
@@ -689,6 +706,9 @@ impl KeysConfig {
         copy_effective_action_field!(zoom, keybinds.zoom);
         copy_effective_action_field!(resize_mode, keybinds.resize_mode);
         copy_effective_action_field!(toggle_sidebar, keybinds.toggle_sidebar);
+        copy_effective_action_field!(toggle_queues_pane, keybinds.toggle_queues_pane);
+        copy_effective_action_field!(focus_queues_pane, keybinds.focus_queues_pane);
+        copy_effective_action_field!(focus_note_pane, keybinds.focus_note_pane);
         copy_user_field!(indexed);
 
         profile
@@ -940,6 +960,9 @@ impl Default for KeysConfig {
             zoom: BindingConfig::one("prefix+z"),
             resize_mode: BindingConfig::one("prefix+r"),
             toggle_sidebar: BindingConfig::one("prefix+b"),
+            toggle_queues_pane: BindingConfig::one("prefix+u"),
+            focus_queues_pane: BindingConfig::one("prefix+shift+q"),
+            focus_note_pane: BindingConfig::one("prefix+shift+e"),
             indexed: IndexedKeysConfig::default(),
             command: Vec::new(),
             user_fields: BTreeSet::new(),

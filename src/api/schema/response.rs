@@ -58,6 +58,13 @@ pub enum ResponseResult {
     WorkspaceList {
         workspaces: Vec<WorkspaceInfo>,
     },
+    QueueContents {
+        count: usize,
+        prompts: Vec<String>,
+    },
+    QueuePopped {
+        text: Option<String>,
+    },
     WorktreeList {
         source: WorktreeSourceInfo,
         worktrees: Vec<WorktreeInfo>,
