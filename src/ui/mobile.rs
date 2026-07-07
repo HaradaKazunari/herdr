@@ -956,6 +956,7 @@ mod tests {
             pane_id: PaneId::from_raw(1),
             primary_label: "herdr".into(),
             primary_tab_label: primary_tab_label.map(str::to_string),
+            tab_label: primary_tab_label.unwrap_or("1").to_string(),
             agent_label: agent_label.map(str::to_string),
             state: AgentState::Idle,
             seen: true,

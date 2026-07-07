@@ -317,6 +317,19 @@ pub(crate) fn render_virtual_with_runtime_registry(
             (!focused_terminal_owns_host_cursor(app_state, terminal_runtimes))
                 .then(|| terminal.backend().rendered_cursor())
                 .flatten()
+                .map(|mut cursor| {
+                    // herdr-owned text inputs (the queues prompt, the note pane)
+                    // park their host cursor via rendered_cursor(), which reports
+                    // DECSCUSR shape 0 (terminal default). A focused terminal pane's
+                    // cursor instead carries a concrete shape, and host IMEs (e.g.
+                    // macSKK in Ghostty) only engage inline composition on such a
+                    // "real" cursor. Give the parked cursor a concrete steady shape
+                    // so IME composition works in these herdr-owned inputs too.
+                    if cursor.shape == 0 {
+                        cursor.shape = app_state.cjk_ime_cursor_shape;
+                    }
+                    cursor
+                })
         })
     };
 

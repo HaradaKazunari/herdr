@@ -587,6 +587,14 @@ impl HeadlessServer {
                 needs_render = true;
             }
 
+            // Queues prompt: open it in an external editor (nvim) for IME-friendly
+            // composition; captured back into the queue when the editor exits.
+            if let Some(req) = self.app.state.request_prompt_editor.take() {
+                self.app.launch_queue_prompt_editor(req);
+                needs_render = true;
+                needs_full_render = true;
+            }
+
             if self.app.state.request_submit_worktree_create {
                 self.app.state.request_submit_worktree_create = false;
                 self.app.start_worktree_add();
@@ -648,6 +656,10 @@ impl HeadlessServer {
                     crate::render_prof::event("full_render.invoke");
                     self.render_and_stream();
                 }
+                // A full render lays out the note pane; spawn nvim at its real size
+                // then (no-op once running). Deferring avoids the wrong-size spawn
+                // that corrupted the initial note display.
+                self.app.ensure_note_terminal();
                 self.app.last_render_at = Some(now);
                 needs_render = false;
                 needs_full_render = false;

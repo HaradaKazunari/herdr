@@ -774,11 +774,20 @@ pub enum Mode {
     GlobalMenu,
     KeybindHelp,
     Navigator,
+    /// Focus is on the left-hand space (workspace) list; `j`/`k` move between
+    /// spaces, `Enter` keeps the chosen space, `Esc` leaves.
+    Spaces,
+    /// Focus is on the agents panel; `j`/`k` move between agents (focusing each
+    /// agent's pane), `Enter` keeps the chosen agent, `Esc` leaves.
+    Agents,
     /// Focus is on the right-hand queues pane (navigate agents with j/k).
     Queues,
     /// Focus is on the right-hand note pane; raw keys are forwarded to the
     /// resident nvim editing `~/workspace/NOTES.md`.
     Note,
+    /// Focus is on the transient queues-prompt editor (nvim) rendered inside the
+    /// queues sub-pane; raw keys are forwarded to it until it exits.
+    PromptEditor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1319,12 +1328,110 @@ pub struct PendingAutosend {
     pub send_enter: bool,
 }
 
+/// A request to compose a queued prompt in an external editor (`nvim`), so the
+/// user can type with their own editor IME (e.g. skkeleton). The App layer spawns
+/// the editor; on exit its buffer becomes the queued prompt.
+#[derive(Debug, Clone)]
+pub struct PromptEditorRequest {
+    pub ws_idx: usize,
+    pub pane_id: crate::layout::PaneId,
+    /// `Some(index)` edits the queued prompt at that index; `None` appends a new one.
+    pub editing: Option<usize>,
+    /// Initial editor buffer contents (the existing prompt when editing).
+    pub initial_text: String,
+}
+
 /// Active text entry in the queues pane: adding or editing a queued prompt.
+/// A minimal single-line editor — `cursor` is a char index into `buffer`.
 #[derive(Debug, Clone)]
 pub struct QueueInputState {
     pub buffer: String,
     /// `Some(index)` edits the queued prompt at that index; `None` appends a new one.
     pub editing: Option<usize>,
+    /// Insertion point as a char index in `[0, buffer char count]`.
+    pub cursor: usize,
+}
+
+impl QueueInputState {
+    /// Open `buffer` for editing with the cursor at its end.
+    pub fn new(buffer: String, editing: Option<usize>) -> Self {
+        let cursor = buffer.chars().count();
+        Self {
+            buffer,
+            editing,
+            cursor,
+        }
+    }
+
+    fn char_len(&self) -> usize {
+        self.buffer.chars().count()
+    }
+
+    /// Byte offset of char index `idx` (clamped to the buffer length).
+    fn byte_at(&self, idx: usize) -> usize {
+        self.buffer
+            .char_indices()
+            .nth(idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.buffer.len())
+    }
+
+    /// Insert a string at the cursor, advancing past it.
+    pub fn insert_str(&mut self, text: &str) {
+        let at = self.byte_at(self.cursor);
+        self.buffer.insert_str(at, text);
+        self.cursor += text.chars().count();
+    }
+
+    /// Delete the char before the cursor (Backspace).
+    pub fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end = self.byte_at(self.cursor);
+        let start = self.byte_at(self.cursor - 1);
+        self.buffer.replace_range(start..end, "");
+        self.cursor -= 1;
+    }
+
+    /// Delete the whitespace-delimited word before the cursor (Ctrl+W).
+    pub fn delete_word_before(&mut self) {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let mut start = self.cursor;
+        while start > 0 && chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        let from = self.byte_at(start);
+        let to = self.byte_at(self.cursor);
+        self.buffer.replace_range(from..to, "");
+        self.cursor = start;
+    }
+
+    /// Delete from the start of the line to the cursor (Ctrl+U).
+    pub fn delete_to_start(&mut self) {
+        let to = self.byte_at(self.cursor);
+        self.buffer.replace_range(..to, "");
+        self.cursor = 0;
+    }
+
+    pub fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.char_len());
+    }
+
+    pub fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn move_end(&mut self) {
+        self.cursor = self.char_len();
+    }
 }
 
 /// All application state — pure data, no channels or async runtime.
@@ -1520,6 +1627,10 @@ pub struct AppState {
     /// `send_enter=false` = manual insert (review then send); `true` = idle
     /// auto-send (fire immediately). A Vec so several agents can dispatch at once.
     pub request_queue_insert: Vec<(usize, crate::layout::PaneId, String, bool)>,
+    /// Pending request to compose a queued prompt in an external editor (`nvim`).
+    /// Set when the user opens the queues prompt; drained by the App layer (which
+    /// owns the PTY-spawning machinery) into an overlay editor pane.
+    pub request_prompt_editor: Option<PromptEditorRequest>,
     /// Registry id of the singleton, always-resident note terminal (an `nvim`
     /// editing `~/workspace/NOTES.md`). `None` until spawned / after it dies.
     /// It lives only in the `TerminalRuntimeRegistry`, outside the workspace
@@ -1528,6 +1639,17 @@ pub struct AppState {
     /// Stable synthetic pane id tagged onto the note terminal's PTY events
     /// (notably `PaneDied`), so the app loop can recognise and respawn it.
     pub note_pane_id: crate::layout::PaneId,
+    /// Registry id of the transient queues-prompt editor terminal (an `nvim`
+    /// editing a temp file), rendered inside the queues sub-pane. `None` unless a
+    /// prompt is being composed/edited. Like the note terminal it lives outside
+    /// the workspace tab tree.
+    pub prompt_editor_terminal_id: Option<crate::terminal::TerminalId>,
+    /// Stable synthetic pane id tagged onto the prompt editor terminal's PTY
+    /// events, so `PaneDied` can be recognised and the buffer read back.
+    pub prompt_editor_pane_id: crate::layout::PaneId,
+    /// Where the prompt editor commits its edited text on exit (queue key +
+    /// original prompt + temp file). `None` unless the editor is open.
+    pub prompt_editor_capture: Option<crate::app::PromptCaptureTarget>,
     /// Set when the user explicitly focuses the note pane; drained by the app
     /// loop to clear the crash-loop block and (re)spawn the note terminal, so a
     /// transiently-broken note pane is always recoverable by re-focusing it.
@@ -1605,6 +1727,26 @@ impl AppState {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Commit prompt text edited in an external editor back into a queue. When
+    /// `original` is given (an edit), re-find that prompt by content — its index
+    /// may have shifted while the editor was open (idle auto-send keeps draining
+    /// the queue) — and edit it in place; if it's gone, append so the user's work
+    /// is never silently lost. When `original` is `None` (a new prompt), append.
+    /// Empty `text` is a no-op.
+    pub fn commit_edited_prompt(&mut self, key: &str, original: Option<&str>, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        let index = original
+            .and_then(|original| self.list_prompts(key).iter().position(|p| p == original));
+        match index {
+            Some(index) => {
+                self.edit_prompt(key, index, text);
+            }
+            None => self.enqueue_prompt(key.to_string(), text),
         }
     }
 
@@ -1695,6 +1837,12 @@ impl AppState {
             };
             self.request_queue_insert
                 .push((pending.ws_idx, pending.pane_id, text, pending.send_enter));
+            // Insert mode is for review: bring the agent's pane into view so the
+            // inserted prompt is visible (matching manual Space-send). Auto-send
+            // stays hands-off and does not steal focus.
+            if !pending.send_enter {
+                self.focus_pane_in_workspace(pending.ws_idx, pending.pane_id);
+            }
             if pending.send_enter {
                 let streak = self.autosend_streak.entry(key.clone()).or_insert(0);
                 *streak = streak.saturating_add(1);
@@ -2053,14 +2201,18 @@ impl AppState {
             agent_queues: std::collections::HashMap::new(),
             agent_autosend: std::collections::HashMap::new(),
             persistent_pane_visible: true,
-            persistent_pane_width: 40,
+            persistent_pane_width: 72,
             persistent_pane_selected: 0,
             persistent_selected_agent: None,
             persistent_item_selected: None,
             persistent_input: None,
             request_queue_insert: Vec::new(),
+            request_prompt_editor: None,
             note_terminal_id: None,
             note_pane_id: crate::layout::PaneId::alloc(),
+            prompt_editor_terminal_id: None,
+            prompt_editor_pane_id: crate::layout::PaneId::alloc(),
+            prompt_editor_capture: None,
             request_ensure_note: false,
             pending_autosend: std::collections::HashMap::new(),
             autosend_streak: std::collections::HashMap::new(),
@@ -2422,6 +2574,34 @@ mod tests {
         assert_eq!(state.pop_prompt(&key), None);
         // Draining the last item prunes the empty queue entry.
         assert!(!state.agent_queues.contains_key(&key));
+    }
+
+    #[test]
+    fn commit_edited_prompt_refinds_by_content_after_index_shift() {
+        let mut state = AppState::test_new();
+        let key = "session:abc".to_string();
+        for p in ["A", "B", "C"] {
+            state.enqueue_prompt(key.clone(), p.into());
+        }
+        // The editor is long-lived: the head is auto-sent (popped) while it is
+        // open, so the captured index goes stale.
+        assert_eq!(state.pop_prompt(&key).as_deref(), Some("A"));
+
+        // Editing "B" (captured at the old index 1) still targets B, not C.
+        state.commit_edited_prompt(&key, Some("B"), "B-edited".into());
+        assert_eq!(state.list_prompts(&key), vec!["B-edited", "C"]);
+
+        // If the original was already drained, append instead of losing the work.
+        state.commit_edited_prompt(&key, Some("vanished"), "rescued".into());
+        assert_eq!(state.list_prompts(&key), vec!["B-edited", "C", "rescued"]);
+
+        // A new prompt (no original) appends; empty text is a no-op.
+        state.commit_edited_prompt(&key, None, "new".into());
+        state.commit_edited_prompt(&key, None, String::new());
+        assert_eq!(
+            state.list_prompts(&key),
+            vec!["B-edited", "C", "rescued", "new"]
+        );
     }
 
     #[test]

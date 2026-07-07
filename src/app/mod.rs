@@ -79,6 +79,24 @@ pub(crate) struct OverlayPaneState {
     previous_focus: crate::layout::PaneId,
     previous_zoomed: bool,
     temp_files: Vec<std::path::PathBuf>,
+    /// When set, the overlay is a queues-prompt editor: on exit, the temp file's
+    /// contents are read back into the target agent's queue before cleanup.
+    prompt_capture: Option<PromptCaptureTarget>,
+}
+
+/// Where a queues-prompt editor overlay should commit its edited text on exit.
+#[derive(Debug, Clone)]
+pub(crate) struct PromptCaptureTarget {
+    pub ws_idx: usize,
+    pub pane_id: crate::layout::PaneId,
+    /// The queue key, snapshotted at launch so a session/cwd change mid-edit can't
+    /// redirect the write to a different queue.
+    pub key: String,
+    /// The prompt being edited, used to re-find it by content on exit (the index
+    /// can shift while the editor is open — idle auto-send keeps draining the
+    /// queue). `None` appends a new prompt.
+    pub original: Option<String>,
+    pub file: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -684,14 +702,18 @@ impl App {
             agent_queues: restored_agent_queues,
             agent_autosend: std::collections::HashMap::new(),
             persistent_pane_visible: true,
-            persistent_pane_width: 40,
+            persistent_pane_width: 72,
             persistent_pane_selected: 0,
             persistent_selected_agent: None,
             persistent_item_selected: None,
             persistent_input: None,
             request_queue_insert: Vec::new(),
+            request_prompt_editor: None,
             note_terminal_id: None,
             note_pane_id: crate::layout::PaneId::alloc(),
+            prompt_editor_terminal_id: None,
+            prompt_editor_pane_id: crate::layout::PaneId::alloc(),
+            prompt_editor_capture: None,
             request_ensure_note: false,
             pending_autosend: std::collections::HashMap::new(),
             autosend_streak: std::collections::HashMap::new(),
@@ -912,11 +934,20 @@ impl App {
         self.prefix_input_source = source;
     }
 
+    /// The nvim grid size for the note terminal, taken from the note pane's
+    /// rendered sub-rect. `None` until the first layout has placed the note pane,
+    /// so the spawn can wait for the real size instead of guessing.
+    fn note_spawn_size(&self) -> Option<(u16, u16)> {
+        let inner = crate::ui::note_inner_rect(self.state.view.note_pane_rect);
+        (inner.width > 0 && inner.height > 0).then_some((inner.height, inner.width))
+    }
+
     /// Spawn the singleton, always-resident note terminal (`nvim ~/workspace/NOTES.md`)
     /// if it is not already running. Idempotent and cheap to call repeatedly: it
     /// returns early when the terminal is alive or auto-respawn is disabled. The
     /// terminal lives only in the runtime registry, outside the workspace tab
-    /// tree, so it is shared across every workspace and tab.
+    /// tree, so it is shared across every workspace and tab. No-op until the note
+    /// pane has been laid out (see [`Self::note_spawn_size`]).
     pub(crate) fn ensure_note_terminal(&mut self) {
         if self.note_respawn_blocked {
             return;
@@ -936,7 +967,13 @@ impl App {
             .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         let argv = vec!["nvim".to_string(), notes_path.to_string_lossy().into_owned()];
-        let (rows, cols) = self.state.estimate_pane_size();
+        // Spawn nvim already sized to the note pane. Before the first layout the
+        // note rect is unknown; defer the spawn until then rather than starting at
+        // a wrong (wide) estimate and shrinking it — that one-time reflow is what
+        // corrupts the initial display until a manual `:q`/respawn.
+        let Some((rows, cols)) = self.note_spawn_size() else {
+            return;
+        };
         let launch_env = crate::pane::PaneLaunchEnv::from_extra(Vec::new());
         let pane_id = self.state.note_pane_id;
 
@@ -1123,6 +1160,13 @@ impl App {
                 needs_render = true;
             }
 
+            // Queues prompt: open it in an external editor (nvim) for IME-friendly
+            // composition; the result is captured when the editor exits.
+            if let Some(req) = self.state.request_prompt_editor.take() {
+                self.launch_queue_prompt_editor(req);
+                needs_render = true;
+            }
+
             if self.state.request_submit_worktree_create {
                 self.state.request_submit_worktree_create = false;
                 self.start_worktree_add();
@@ -1202,6 +1246,9 @@ impl App {
                     self.render_dirty.store(true, Ordering::Release);
                     self.render_notify.notify_one();
                 }
+                // Now that the layout has placed the note pane, spawn nvim at its
+                // real size (no-op once running).
+                self.ensure_note_terminal();
                 self.last_render_at = Some(now);
                 needs_render = false;
                 continue;
@@ -1815,8 +1862,17 @@ impl App {
             Mode::Queues => {
                 input::handle_queues_key(&mut self.state, key);
             }
+            Mode::Spaces => {
+                input::handle_spaces_key(&mut self.state, key);
+            }
+            Mode::Agents => {
+                input::handle_agents_key(&mut self.state, key);
+            }
             Mode::Note => {
                 self.handle_note_key(key);
+            }
+            Mode::PromptEditor => {
+                self.handle_prompt_editor_key(key);
             }
             Mode::ConfirmClose => {
                 input::handle_confirm_close_key(&mut self.state, key_event);

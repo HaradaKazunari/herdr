@@ -303,6 +303,166 @@ impl App {
         Ok(())
     }
 
+    /// Drain a pending request to compose a queued prompt in `nvim` (set when the
+    /// user opens the queues prompt). Spawns a transient editor terminal rendered
+    /// inside the queues sub-pane; the buffer is read back into the agent's queue
+    /// when the editor exits (see `handle_prompt_editor_terminal_died`).
+    pub(crate) fn launch_queue_prompt_editor(
+        &mut self,
+        req: crate::app::state::PromptEditorRequest,
+    ) {
+        let previous_toast = self.state.toast.clone();
+        match self.open_queue_prompt_in_editor(&req) {
+            Ok(()) => self.sync_toast_deadline(previous_toast),
+            Err(err) => {
+                self.state.toast = Some(crate::app::state::ToastNotification {
+                    kind: crate::app::state::ToastKind::NeedsAttention,
+                    title: "prompt editor failed".to_string(),
+                    context: err.to_string(),
+                    position: None,
+                    target: None,
+                });
+                self.sync_toast_deadline(previous_toast);
+            }
+        }
+    }
+
+    fn open_queue_prompt_in_editor(
+        &mut self,
+        req: &crate::app::state::PromptEditorRequest,
+    ) -> std::io::Result<()> {
+        // Snapshot the queue key now so a session/cwd change mid-edit can't move
+        // the target queue out from under us.
+        let key = self.state.queue_key_for_pane(req.ws_idx, req.pane_id);
+        let original = req.editing.map(|_| req.initial_text.clone());
+
+        let path = write_prompt_temp_file(&req.initial_text)?;
+
+        // Size nvim to the queues sub-pane (right column, below the note pane):
+        // LEFT border drops one column, the title reserves the top row. The
+        // render-time resize corrects any drift, so an estimate is fine here.
+        let area = self.state.view.persistent_pane_rect;
+        let rows = area.height.saturating_sub(1).max(2);
+        let cols = area.width.saturating_sub(1).max(4);
+        let cwd = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let argv = vec!["nvim".to_string(), path.display().to_string()];
+        let launch_env = crate::pane::PaneLaunchEnv::from_extra(Vec::new());
+        let pane_id = self.state.prompt_editor_pane_id;
+
+        let runtime = match crate::terminal::TerminalRuntime::spawn_argv_command(
+            pane_id,
+            rows,
+            cols,
+            cwd,
+            &argv,
+            &launch_env,
+            self.state.pane_scrollback_limit_bytes,
+            self.state.host_terminal_theme,
+            self.event_tx.clone(),
+            self.render_notify.clone(),
+            self.render_dirty.clone(),
+        ) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                let _ = fs::remove_file(&path);
+                return Err(err);
+            }
+        };
+
+        // Drop any stale editor terminal before installing the new one.
+        if let Some(old) = self.state.prompt_editor_terminal_id.take() {
+            if let Some(rt) = self.terminal_runtimes.remove(&old) {
+                rt.shutdown();
+            }
+        }
+        let id = crate::terminal::TerminalId::alloc();
+        self.terminal_runtimes.insert(id.clone(), runtime);
+        self.state.prompt_editor_terminal_id = Some(id);
+        self.state.prompt_editor_capture = Some(crate::app::PromptCaptureTarget {
+            ws_idx: req.ws_idx,
+            pane_id: req.pane_id,
+            key,
+            original,
+            file: path,
+        });
+        self.state.persistent_pane_visible = true;
+        self.state.mode = Mode::PromptEditor;
+        self.render_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.render_notify.notify_one();
+        Ok(())
+    }
+
+    /// `Mode::PromptEditor`: forward raw keys to the transient queues-prompt
+    /// editor terminal's PTY (nvim). The prefix key is the escape hatch out, like
+    /// the note pane; every other key (including `Esc`, which nvim needs) goes
+    /// straight to nvim. `:wq` exits and commits via the PaneDied handler.
+    pub(crate) fn handle_prompt_editor_key(&mut self, key: TerminalKey) {
+        if self.state.is_prefix_key(key) {
+            self.state.mode = Mode::Prefix;
+            return;
+        }
+        let Some(id) = self.state.prompt_editor_terminal_id.clone() else {
+            self.state.mode = Mode::Queues;
+            return;
+        };
+        let Some(rt) = self.terminal_runtimes.get(&id) else {
+            self.state.mode = Mode::Queues;
+            return;
+        };
+        let bytes = rt.encode_terminal_key(key);
+        if !bytes.is_empty() {
+            let _ = rt.try_send_bytes(Bytes::from(bytes));
+        }
+    }
+
+    /// React to a `PaneDied` for the prompt editor terminal: read the edited
+    /// buffer back into the target agent's queue, drop the terminal, and return
+    /// focus to the queues pane. Returns true if `pane_id` was the editor.
+    pub(crate) fn handle_prompt_editor_terminal_died(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+    ) -> bool {
+        if self.state.prompt_editor_terminal_id.is_none()
+            || pane_id != self.state.prompt_editor_pane_id
+        {
+            return false;
+        }
+        if let Some(id) = self.state.prompt_editor_terminal_id.take() {
+            if let Some(runtime) = self.terminal_runtimes.remove(&id) {
+                runtime.shutdown();
+            }
+        }
+        if let Some(capture) = self.state.prompt_editor_capture.take() {
+            match std::fs::read_to_string(&capture.file) {
+                Ok(raw) => {
+                    let text = raw.trim().to_string();
+                    self.state
+                        .commit_edited_prompt(&capture.key, capture.original.as_deref(), text);
+                }
+                Err(err) => {
+                    tracing::warn!(err = %err, "failed to read prompt editor buffer");
+                    self.state.toast = Some(crate::app::state::ToastNotification {
+                        kind: crate::app::state::ToastKind::NeedsAttention,
+                        title: "prompt not saved".to_string(),
+                        context: err.to_string(),
+                        position: None,
+                        target: None,
+                    });
+                }
+            }
+            let _ = fs::remove_file(&capture.file);
+            self.state.persistent_pane_visible = true;
+            self.state.persistent_selected_agent = Some((capture.ws_idx, capture.pane_id));
+        }
+        if self.state.mode == Mode::PromptEditor {
+            self.state.mode = Mode::Queues;
+        }
+        true
+    }
+
     fn spawn_pane_command(
         &mut self,
         command: &str,
@@ -372,6 +532,7 @@ impl App {
                 previous_focus,
                 previous_zoomed,
                 temp_files,
+                prompt_capture: None,
             },
         );
         self.state.remove_alias_shadowed_by_new_pane(new_pane_id);
@@ -448,6 +609,7 @@ impl App {
                     previous_focus,
                     previous_zoomed,
                     temp_files,
+                    prompt_capture: None,
                 },
             );
             (tab_idx, new_pane, ws.id.clone())
@@ -625,6 +787,8 @@ pub(crate) enum NavigateAction {
     ToggleSidebar,
     ToggleQueuesPane,
     FocusQueuesPane,
+    FocusSpaces,
+    FocusAgents,
     FocusNotePane,
     CyclePaneNext,
     CyclePanePrevious,
@@ -735,6 +899,8 @@ fn action_for_key(
         (&kb.toggle_sidebar, NavigateAction::ToggleSidebar),
         (&kb.toggle_queues_pane, NavigateAction::ToggleQueuesPane),
         (&kb.focus_queues_pane, NavigateAction::FocusQueuesPane),
+        (&kb.focus_spaces, NavigateAction::FocusSpaces),
+        (&kb.focus_agents, NavigateAction::FocusAgents),
         (&kb.focus_note_pane, NavigateAction::FocusNotePane),
         (&kb.reload_config, NavigateAction::ReloadConfig),
         (
@@ -956,6 +1122,19 @@ pub(super) fn execute_navigate_action_in_context(
             state.persistent_input = None;
             state.mode = Mode::Queues;
         }
+        NavigateAction::FocusSpaces => {
+            // The space list lives in the sidebar; make sure it is visible.
+            state.sidebar_collapsed = false;
+            // Start from the active space so j/k move relative to where we are.
+            state.selected = state.active.unwrap_or(state.selected);
+            state.ensure_workspace_visible(state.selected);
+            state.mode = Mode::Spaces;
+        }
+        NavigateAction::FocusAgents => {
+            // The agents panel lives in the sidebar; make sure it is visible.
+            state.sidebar_collapsed = false;
+            state.mode = Mode::Agents;
+        }
         NavigateAction::FocusNotePane => {
             state.persistent_pane_visible = true;
             // Re-focusing always re-attempts a spawn (and clears any crash-loop
@@ -1059,6 +1238,28 @@ fn leave_command_mode(state: &mut AppState) {
     } else {
         Mode::Navigate
     };
+}
+
+fn write_prompt_temp_file(initial: &str) -> io::Result<std::path::PathBuf> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    // `.md` so the editor picks a sensible filetype for prose prompts.
+    let path = std::env::temp_dir().join(format!(
+        "herdr-prompt-{}-{nanos}.md",
+        std::process::id()
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(initial.as_bytes())?;
+    Ok(path)
 }
 
 fn write_scrollback_temp_file(content: &str) -> io::Result<std::path::PathBuf> {
@@ -2165,6 +2366,95 @@ last_pane = "prefix+tab"
         assert!(!app.state.workspaces[0].tabs[0].zoomed);
         assert_eq!(app.state.mode, Mode::Terminal);
         let _ = std::fs::remove_file(output_path);
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+    }
+
+    // Regression: the queues prompt editor must register its PTY runtime/terminal.
+    // Otherwise the NewPane (which owns the PTY master) is dropped, the master
+    // closes, and the nvim child dies immediately with SIGHUP — the editor never
+    // appears. See open_queue_prompt_in_editor.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queues_enter_editor_registers_runtime_so_pty_survives() {
+        let nvim_missing = std::process::Command::new("nvim")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true);
+        if nvim_missing {
+            eprintln!("skipping queues editor test: nvim not available");
+            return;
+        }
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let (workspace, terminal, runtime) = Workspace::new(
+            std::env::current_dir().unwrap_or_else(|_| "/".into()),
+            24,
+            80,
+            app.state.pane_scrollback_limit_bytes,
+            app.state.host_terminal_theme,
+            crate::pane::PaneShellConfig::new(&app.state.default_shell, app.state.shell_mode),
+            app.event_tx.clone(),
+            app.render_notify.clone(),
+            app.render_dirty.clone(),
+        )
+        .expect("workspace should spawn");
+        let root_pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.terminal_runtimes.insert(terminal.id.clone(), runtime);
+        app.state.terminals.insert(terminal.id.clone(), terminal);
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Queues;
+        app.state.persistent_selected_agent = Some((0, root_pane));
+
+        // Enter requests the editor; drain the request like the event loop does.
+        app.handle_key(TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()))
+            .await;
+        let req = app
+            .state
+            .request_prompt_editor
+            .take()
+            .expect("Enter should request the prompt editor");
+        app.launch_queue_prompt_editor(req);
+
+        // The editor is a standalone terminal rendered in the queues sub-pane: it
+        // must NOT split the work area, its PTY runtime MUST be registered (root +
+        // editor = 2) so the child is not SIGHUP'd, and focus moves to it.
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].layout.pane_count(),
+            1,
+            "editor must not split the work area"
+        );
+        assert!(
+            app.state.prompt_editor_terminal_id.is_some(),
+            "editor terminal id must be set"
+        );
+        assert!(
+            app.state.prompt_editor_capture.is_some(),
+            "editor capture target must be set for write-back on exit"
+        );
+        assert_eq!(
+            app.terminal_runtimes.len(),
+            2,
+            "editor PTY runtime must be registered (root + editor)"
+        );
+        assert!(
+            app.state.toast.is_none(),
+            "editor spawn should not raise a failure toast"
+        );
+        assert_eq!(app.state.mode, Mode::PromptEditor);
 
         let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
         for (_terminal_id, runtime) in runtimes {

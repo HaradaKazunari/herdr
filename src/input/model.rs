@@ -50,6 +50,16 @@ pub fn ime_compatible_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
 }
 
+/// Escape hatch: when `HERDR_DISABLE_KEYBOARD_ENHANCEMENT` is set, herdr does not
+/// push the Kitty keyboard-enhancement flags onto the host terminal. Some
+/// terminal + input-method combinations (e.g. macSKK) won't compose CJK text
+/// while the progressive keyboard protocol is active; disabling it restores IME
+/// composition at the cost of some modified-key disambiguation.
+#[cfg(not(windows))]
+pub fn keyboard_enhancement_disabled() -> bool {
+    std::env::var_os("HERDR_DISABLE_KEYBOARD_ENHANCEMENT").is_some()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModifyOtherKeysMode {
     Mode1,

@@ -656,6 +656,16 @@ pub(crate) fn handle_queues_key(state: &mut AppState, raw_key: TerminalKey) {
         return;
     }
 
+    // Jump straight to the resident note pane (focus_note_pane keybind) from any
+    // non-text-entry sub-state, so the user can hop queues → note without first
+    // leaving the queues pane. Mirrors how focus_queues_pane's RHS works below.
+    if state.keybinds.focus_note_pane.matches_direct_key(raw_key)
+        || state.keybinds.focus_note_pane.matches_prefix_key(raw_key)
+    {
+        enter_note_pane(state);
+        return;
+    }
+
     // The focused agent's queue key (None when there are no agents).
     let queue_key = state
         .persistent_selected_agent
@@ -676,14 +686,28 @@ pub(crate) fn handle_queues_key(state: &mut AppState, raw_key: TerminalKey) {
                 state.persistent_item_selected = Some(item.saturating_sub(1));
             }
             KeyCode::Enter => {
+                if let (Some((ws_idx, pane_id)), Some(text)) = (
+                    state.persistent_selected_agent,
+                    queue_key
+                        .as_deref()
+                        .and_then(|k| state.list_prompts(k).into_iter().nth(item)),
+                ) {
+                    // Edit the existing prompt in an external editor (nvim).
+                    state.request_prompt_editor = Some(crate::app::state::PromptEditorRequest {
+                        ws_idx,
+                        pane_id,
+                        editing: Some(item),
+                        initial_text: text,
+                    });
+                }
+            }
+            // `i`: quick inline edit in the persistent pane (no external editor).
+            KeyCode::Char('i') => {
                 if let Some(text) = queue_key
                     .as_deref()
                     .and_then(|k| state.list_prompts(k).into_iter().nth(item))
                 {
-                    state.persistent_input = Some(QueueInputState {
-                        buffer: text,
-                        editing: Some(item),
-                    });
+                    state.persistent_input = Some(QueueInputState::new(text, Some(item)));
                 }
             }
             KeyCode::Char('d') => {
@@ -716,13 +740,23 @@ pub(crate) fn handle_queues_key(state: &mut AppState, raw_key: TerminalKey) {
         KeyCode::Char('k') | KeyCode::Up => {
             state.persistent_pane_selected = state.persistent_pane_selected.saturating_sub(1);
         }
-        KeyCode::Enter if queue_key.is_some() => {
-            state.persistent_input = Some(QueueInputState {
-                buffer: String::new(),
-                editing: None,
-            });
+        KeyCode::Enter => {
+            if let Some((ws_idx, pane_id)) = state.persistent_selected_agent {
+                // Compose the new prompt in an external editor (nvim) so the user's
+                // own editor IME (e.g. skkeleton) is available.
+                state.request_prompt_editor = Some(crate::app::state::PromptEditorRequest {
+                    ws_idx,
+                    pane_id,
+                    editing: None,
+                    initial_text: String::new(),
+                });
+            }
         }
         KeyCode::Char(' ') => queues_send_to_agent(state, queue_key.as_deref(), None),
+        // `i`: quick inline new prompt in the persistent pane (no external editor).
+        KeyCode::Char('i') if queue_key.is_some() => {
+            state.persistent_input = Some(QueueInputState::new(String::new(), None));
+        }
         // Cycle idle automation for the selected agent: off → insert → send → off.
         KeyCode::Char('a') => {
             if let Some(key) = queue_key.clone() {
@@ -741,8 +775,12 @@ pub(crate) fn handle_queues_key(state: &mut AppState, raw_key: TerminalKey) {
     }
 }
 
-/// Text entry for adding or editing a queued prompt.
+/// Text entry for adding or editing a queued prompt. A minimal line editor:
+/// arrows / Home / End move the cursor; Ctrl+W deletes the previous word, Ctrl+U
+/// the line before the cursor; Backspace and printable chars edit at the cursor.
 fn handle_queues_input_key(state: &mut AppState, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
         KeyCode::Esc => state.persistent_input = None,
         KeyCode::Enter => {
@@ -761,17 +799,28 @@ fn handle_queues_input_key(state: &mut AppState, key: KeyEvent) {
                 }
             }
         }
-        KeyCode::Backspace => {
-            if let Some(input) = state.persistent_input.as_mut() {
-                input.buffer.pop();
+        _ => {
+            let Some(input) = state.persistent_input.as_mut() else {
+                return;
+            };
+            match key.code {
+                KeyCode::Left => input.move_left(),
+                KeyCode::Right => input.move_right(),
+                KeyCode::Home => input.move_home(),
+                KeyCode::End => input.move_end(),
+                KeyCode::Char('a') if ctrl => input.move_home(),
+                KeyCode::Char('e') if ctrl => input.move_end(),
+                KeyCode::Char('u') if ctrl => input.delete_to_start(),
+                // Zsh parity: Ctrl+W / Alt+Backspace kill the previous word…
+                KeyCode::Char('w') if ctrl => input.delete_word_before(),
+                KeyCode::Backspace if alt => input.delete_word_before(),
+                // …while Ctrl+H and Backspace delete a single char.
+                KeyCode::Char('h') if ctrl => input.backspace(),
+                KeyCode::Backspace => input.backspace(),
+                KeyCode::Char(c) if !ctrl && !alt => input.insert_str(&c.to_string()),
+                _ => {}
             }
         }
-        KeyCode::Char(c) => {
-            if let Some(input) = state.persistent_input.as_mut() {
-                input.buffer.push(c);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -780,6 +829,82 @@ fn leave_queues_mode(state: &mut AppState) {
     state.persistent_item_selected = None;
     state.persistent_input = None;
     state.persistent_selected_agent = None;
+    state.mode = if state.active.is_some() {
+        Mode::Terminal
+    } else {
+        Mode::Navigate
+    };
+}
+
+/// Switch focus from the queues overlay to the resident note pane. Keeps the
+/// FocusNotePane recovery behavior: re-focusing re-attempts a spawn so a
+/// transiently-broken note pane is user-recoverable.
+fn enter_note_pane(state: &mut AppState) {
+    state.persistent_item_selected = None;
+    state.persistent_input = None;
+    state.persistent_pane_visible = true;
+    state.request_ensure_note = true;
+    state.mode = Mode::Note;
+}
+
+/// Input while focused on the space (workspace) list (`Mode::Spaces`). `j`/`k`
+/// move to the next/previous visible space and switch to it live; `Enter` keeps
+/// the current space and leaves; `Esc`/`q`/the focus key leave as well.
+pub(crate) fn handle_spaces_key(state: &mut AppState, raw_key: TerminalKey) {
+    let key = raw_key.as_key_event();
+
+    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter)
+        || state.keybinds.focus_spaces.matches_prefix_key(raw_key)
+        || state.keybinds.focus_spaces.matches_direct_key(raw_key)
+    {
+        leave_spaces_mode(state);
+        return;
+    }
+    let delta = match key.code {
+        KeyCode::Char('j') | KeyCode::Down => 1,
+        KeyCode::Char('k') | KeyCode::Up => -1,
+        _ => return,
+    };
+    let before = state.selected;
+    state.move_selected_workspace_by_visible_delta(delta);
+    if state.selected != before {
+        state.switch_workspace(state.selected);
+    }
+}
+
+/// Leave `Mode::Spaces`, returning to the active space's terminal (or navigate
+/// mode when no space is active).
+fn leave_spaces_mode(state: &mut AppState) {
+    state.mode = if state.active.is_some() {
+        Mode::Terminal
+    } else {
+        Mode::Navigate
+    };
+}
+
+/// Input while focused on the agents panel (`Mode::Agents`). `j`/`k` move to the
+/// next/previous agent and focus its pane live; `Enter` keeps the focused agent
+/// and leaves; `Esc`/`q`/the focus key leave as well.
+pub(crate) fn handle_agents_key(state: &mut AppState, raw_key: TerminalKey) {
+    let key = raw_key.as_key_event();
+
+    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter)
+        || state.keybinds.focus_agents.matches_prefix_key(raw_key)
+        || state.keybinds.focus_agents.matches_direct_key(raw_key)
+    {
+        leave_agents_mode(state);
+        return;
+    }
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => state.next_agent(),
+        KeyCode::Char('k') | KeyCode::Up => state.previous_agent(),
+        _ => {}
+    }
+}
+
+/// Leave `Mode::Agents`, returning to the focused agent's terminal (or navigate
+/// mode when no space is active).
+fn leave_agents_mode(state: &mut AppState) {
     state.mode = if state.active.is_some() {
         Mode::Terminal
     } else {
@@ -1101,16 +1226,16 @@ mod tests {
     }
 
     #[test]
-    fn queues_full_flow_enter_opens_input_then_types_and_commits() {
+    fn queues_inline_flow_opens_input_then_types_and_commits() {
         let mut state = AppState::test_new();
         state.mode = Mode::Queues;
         let pane = crate::layout::PaneId::from_raw(1);
         state.persistent_selected_agent = Some((0, pane));
         let key = state.queue_key_for_pane(0, pane);
 
-        // Enter (AgentNav) opens the add-input buffer.
-        handle_queues_key(&mut state, TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()));
-        assert!(state.persistent_input.is_some(), "Enter should open the input");
+        // `i` (AgentNav) opens the inline add-input buffer (Enter opens nvim).
+        handle_queues_key(&mut state, TerminalKey::new(KeyCode::Char('i'), KeyModifiers::empty()));
+        assert!(state.persistent_input.is_some(), "`i` should open the inline input");
 
         // Subsequent keys are routed to the input buffer, not agent navigation.
         for c in ['h', 'i'] {
@@ -1128,6 +1253,80 @@ mod tests {
         handle_queues_key(&mut state, TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()));
         assert!(state.persistent_input.is_none());
         assert_eq!(state.list_prompts(&key), vec!["hi".to_string()]);
+    }
+
+    #[test]
+    fn spaces_jk_switch_active_space_live_and_keep_mode() {
+        let mut state = state_with_workspaces(&["a", "b", "c"]);
+        state.mode = Mode::Spaces;
+        assert_eq!(state.active, Some(0));
+
+        let j = || TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty());
+        handle_spaces_key(&mut state, j());
+        assert_eq!(state.active, Some(1), "j moves to the next space");
+        assert_eq!(state.mode, Mode::Spaces, "stays in spaces focus");
+
+        handle_spaces_key(&mut state, j());
+        assert_eq!(state.active, Some(2));
+        // Clamps at the last space (no wrap).
+        handle_spaces_key(&mut state, j());
+        assert_eq!(state.active, Some(2));
+
+        handle_spaces_key(
+            &mut state,
+            TerminalKey::new(KeyCode::Char('k'), KeyModifiers::empty()),
+        );
+        assert_eq!(state.active, Some(1), "k moves back up");
+        assert_eq!(state.mode, Mode::Spaces);
+    }
+
+    #[test]
+    fn spaces_enter_and_esc_leave_to_active_space_terminal() {
+        let mut state = state_with_workspaces(&["a", "b"]);
+
+        state.mode = Mode::Spaces;
+        handle_spaces_key(
+            &mut state,
+            TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(state.mode, Mode::Terminal, "Enter keeps the space and leaves");
+
+        state.mode = Mode::Spaces;
+        handle_spaces_key(
+            &mut state,
+            TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()),
+        );
+        assert_eq!(state.mode, Mode::Terminal, "Esc leaves too");
+    }
+
+    #[test]
+    fn agents_jk_navigate_and_keep_mode_then_enter_esc_leave() {
+        let mut state = state_with_workspaces(&["a", "b"]);
+        state.mode = Mode::Agents;
+
+        handle_agents_key(
+            &mut state,
+            TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty()),
+        );
+        assert_eq!(state.mode, Mode::Agents, "j navigates, stays in agents focus");
+        handle_agents_key(
+            &mut state,
+            TerminalKey::new(KeyCode::Char('k'), KeyModifiers::empty()),
+        );
+        assert_eq!(state.mode, Mode::Agents);
+
+        handle_agents_key(
+            &mut state,
+            TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(state.mode, Mode::Terminal, "Enter keeps the agent and leaves");
+
+        state.mode = Mode::Agents;
+        handle_agents_key(
+            &mut state,
+            TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()),
+        );
+        assert_eq!(state.mode, Mode::Terminal, "Esc leaves too");
     }
 
     #[test]
@@ -1162,10 +1361,7 @@ mod tests {
         let key = state.queue_key_for_pane(0, pane);
 
         // Add: type "hi", Enter commits and closes the input.
-        state.persistent_input = Some(QueueInputState {
-            buffer: String::new(),
-            editing: None,
-        });
+        state.persistent_input = Some(QueueInputState::new(String::new(), None));
         for c in ['h', 'i'] {
             handle_queues_input_key(
                 &mut state,
@@ -1177,24 +1373,109 @@ mod tests {
         assert_eq!(state.list_prompts(&key), vec!["hi".to_string()]);
 
         // Edit item 0 in place.
-        state.persistent_input = Some(QueueInputState {
-            buffer: "HX".to_string(),
-            editing: Some(0),
-        });
+        state.persistent_input = Some(QueueInputState::new("HX".to_string(), Some(0)));
         handle_queues_input_key(&mut state, enter());
         assert_eq!(state.list_prompts(&key), vec!["HX".to_string()]);
 
         // Esc cancels without committing; an empty buffer commits nothing.
-        state.persistent_input = Some(QueueInputState {
-            buffer: "zz".to_string(),
-            editing: None,
-        });
+        state.persistent_input = Some(QueueInputState::new("zz".to_string(), None));
         handle_queues_input_key(
             &mut state,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
         );
         assert!(state.persistent_input.is_none());
         assert_eq!(state.list_prompts(&key), vec!["HX".to_string()]);
+    }
+
+    #[test]
+    fn queues_input_supports_word_delete_and_cursor_movement() {
+        let mut state = AppState::test_new();
+        state.persistent_input = Some(QueueInputState::new(String::new(), None));
+        let typed = |state: &mut AppState, c: char| {
+            handle_queues_input_key(state, KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        };
+        let buffer = |state: &AppState| state.persistent_input.as_ref().unwrap().buffer.clone();
+
+        for c in "foo bar".chars() {
+            typed(&mut state, c);
+        }
+        // Ctrl+W deletes the trailing word.
+        handle_queues_input_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(buffer(&state), "foo ");
+
+        // Left moves into the text; a typed char inserts at the cursor.
+        handle_queues_input_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::empty()),
+        );
+        typed(&mut state, 'X');
+        assert_eq!(buffer(&state), "fooX ");
+
+        // Home jumps to the start; the next char prepends.
+        handle_queues_input_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Home, KeyModifiers::empty()),
+        );
+        typed(&mut state, '>');
+        assert_eq!(buffer(&state), ">fooX ");
+    }
+
+    #[test]
+    fn queues_input_ctrl_h_deletes_char_ctrl_w_deletes_word() {
+        let mut state = AppState::test_new();
+        state.persistent_input = Some(QueueInputState::new("ab cd".to_string(), None));
+        let send = |state: &mut AppState, c: char| {
+            handle_queues_input_key(state, KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+        };
+        let buffer = |state: &AppState| state.persistent_input.as_ref().unwrap().buffer.clone();
+
+        // Ctrl+H deletes a single char (zsh backward-delete-char).
+        send(&mut state, 'h');
+        assert_eq!(buffer(&state), "ab c");
+        // Ctrl+W deletes the whole trailing word (zsh backward-kill-word).
+        send(&mut state, 'w');
+        assert_eq!(buffer(&state), "ab ");
+    }
+
+    #[test]
+    fn queues_enter_requests_external_nvim_editor() {
+        let mut state = AppState::test_new();
+        state.mode = Mode::Queues;
+        let pane = crate::layout::PaneId::from_raw(1);
+        state.persistent_selected_agent = Some((0, pane));
+
+        // AgentNav Enter requests a new-prompt editor (no inline buffer).
+        handle_queues_key(&mut state, TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(state.persistent_input.is_none());
+        let req = state
+            .request_prompt_editor
+            .take()
+            .expect("Enter should request the editor");
+        assert_eq!(req.pane_id, pane);
+        assert_eq!(req.editing, None);
+        assert!(req.initial_text.is_empty());
+    }
+
+    #[test]
+    fn queues_item_enter_requests_editor_prefilled_with_existing_text() {
+        let mut state = AppState::test_new();
+        state.mode = Mode::Queues;
+        let pane = crate::layout::PaneId::from_raw(1);
+        state.persistent_selected_agent = Some((0, pane));
+        let key = state.queue_key_for_pane(0, pane);
+        state.enqueue_prompt(key, "こんにちは".to_string());
+        state.persistent_item_selected = Some(0);
+
+        handle_queues_key(&mut state, TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()));
+        let req = state
+            .request_prompt_editor
+            .take()
+            .expect("Enter should request the editor");
+        assert_eq!(req.editing, Some(0));
+        assert_eq!(req.initial_text, "こんにちは");
     }
 
     fn temp_config_path(name: &str) -> std::path::PathBuf {

@@ -69,7 +69,7 @@ pub(crate) use self::{
         SETTINGS_POPUP_WIDTH,
     },
     sidebar::{
-        agent_panel_body_rect, agent_panel_entries, agent_panel_scroll_metrics,
+        agent_panel_body_rect, agent_panel_entries, agent_panel_layout, agent_panel_scroll_metrics,
         agent_panel_scrollbar_rect, agent_panel_toggle_rect, collapsed_sidebar_sections,
         collapsed_sidebar_toggle_rect, compute_workspace_card_areas, expanded_sidebar_sections,
         expanded_sidebar_toggle_rect, normalized_workspace_scroll, sidebar_section_divider_rect,
@@ -85,6 +85,7 @@ pub(crate) use self::{
         mobile_switcher_workspace_doc_range, MobileSwitcherTarget,
     },
     panes::{apply_pane_chrome, pane_inner_rect, pane_is_scrolled_back},
+    persistent::note_inner_rect,
     tabs::compute_tab_bar_view,
     widgets::{centered_popup_rect, modal_stack_areas},
 };
@@ -214,7 +215,10 @@ fn compute_view_internal(
 
     // If the persistent column collapses (terminal too narrow), don't strand the
     // user focused on an invisible note/queues pane — drop to a usable mode.
-    if resize_panes && persistent_area.width == 0 && matches!(app.mode, Mode::Queues | Mode::Note) {
+    if resize_panes
+        && persistent_area.width == 0
+        && matches!(app.mode, Mode::Queues | Mode::Note | Mode::PromptEditor)
+    {
         app.mode = if app.active.is_some() {
             Mode::Terminal
         } else {
@@ -225,8 +229,9 @@ fn compute_view_internal(
     // Split the persistent column into the resident note pane (nvim) on top and
     // the agent queues below. Empty (width 0) when the column is hidden/narrow.
     let (note_area, queues_area) = if persistent_area.width >= 1 {
+        // note:queues = 3:2 (note on top).
         let [note_area, queues_area] =
-            Layout::vertical([Constraint::Percentage(40), Constraint::Min(1)])
+            Layout::vertical([Constraint::Ratio(3, 5), Constraint::Ratio(2, 5)])
                 .areas(persistent_area);
         (note_area, queues_area)
     } else {
@@ -240,6 +245,17 @@ fn compute_view_internal(
             .and_then(|id| terminal_runtimes.get(id))
         {
             let inner = persistent::note_inner_rect(note_area);
+            if inner.width > 0 && inner.height > 0 {
+                rt.resize(inner.height, inner.width, cell_size.width_px, cell_size.height_px);
+            }
+        }
+        // Keep the transient prompt editor PTY sized to the queues sub-pane.
+        if let Some(rt) = app
+            .prompt_editor_terminal_id
+            .as_ref()
+            .and_then(|id| terminal_runtimes.get(id))
+        {
+            let inner = persistent::queues_inner_rect(queues_area);
             if inner.width > 0 && inner.height > 0 {
                 rt.resize(inner.height, inner.width, cell_size.width_px, cell_size.height_px);
             }
@@ -390,7 +406,7 @@ fn compute_mobile_view(
 ) {
     // The persistent column (note + queues) is not drawn in the mobile layout;
     // don't leave the user focused on an invisible pane.
-    if resize_panes && matches!(app.mode, Mode::Queues | Mode::Note) {
+    if resize_panes && matches!(app.mode, Mode::Queues | Mode::Note | Mode::PromptEditor) {
         app.mode = if app.active.is_some() {
             Mode::Terminal
         } else {
@@ -539,9 +555,14 @@ pub fn render_with_runtime_registry(
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
         // The queues and note panes draw their own focus highlight in the
-        // persistent column; no overlay is needed.
+        // persistent column; the spaces focus highlights the sidebar workspace
+        // list directly. No overlay is needed for any of them.
         Mode::Queues => {}
+        Mode::Spaces => {}
+        Mode::Agents => {}
         Mode::Note => {}
+        // The prompt editor draws inside the queues sub-pane; no overlay needed.
+        Mode::PromptEditor => {}
         Mode::Terminal => {}
     }
 }

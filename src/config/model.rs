@@ -402,6 +402,12 @@ pub struct KeysConfig {
     pub toggle_queues_pane: BindingConfig,
     /// Focus the queues pane to navigate agents. Default: "prefix+shift+q".
     pub focus_queues_pane: BindingConfig,
+    /// Focus the space (workspace) list to move between spaces with j/k.
+    /// Default: "prefix+shift+s".
+    pub focus_spaces: BindingConfig,
+    /// Focus the agents panel to move between agents with j/k. Default:
+    /// "prefix+shift+a".
+    pub focus_agents: BindingConfig,
     /// Focus the resident note pane (nvim on ~/workspace/NOTES.md); keys are
     /// forwarded to nvim, the prefix key exits. Default: "prefix+shift+e".
     pub focus_note_pane: BindingConfig,
@@ -528,6 +534,10 @@ pub(crate) struct KeysConfigOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     focus_queues_pane: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    focus_spaces: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focus_agents: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     focus_note_pane: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     indexed: Option<IndexedKeysConfig>,
@@ -607,6 +617,8 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(toggle_sidebar);
         apply_field!(toggle_queues_pane);
         apply_field!(focus_queues_pane);
+        apply_field!(focus_spaces);
+        apply_field!(focus_agents);
         apply_field!(focus_note_pane);
         apply_field!(indexed);
         apply_field!(command);
@@ -708,6 +720,8 @@ impl KeysConfig {
         copy_effective_action_field!(toggle_sidebar, keybinds.toggle_sidebar);
         copy_effective_action_field!(toggle_queues_pane, keybinds.toggle_queues_pane);
         copy_effective_action_field!(focus_queues_pane, keybinds.focus_queues_pane);
+        copy_effective_action_field!(focus_spaces, keybinds.focus_spaces);
+        copy_effective_action_field!(focus_agents, keybinds.focus_agents);
         copy_effective_action_field!(focus_note_pane, keybinds.focus_note_pane);
         copy_user_field!(indexed);
 
@@ -962,6 +976,8 @@ impl Default for KeysConfig {
             toggle_sidebar: BindingConfig::one("prefix+b"),
             toggle_queues_pane: BindingConfig::one("prefix+u"),
             focus_queues_pane: BindingConfig::one("prefix+shift+q"),
+            focus_spaces: BindingConfig::one("prefix+shift+s"),
+            focus_agents: BindingConfig::one("prefix+shift+a"),
             focus_note_pane: BindingConfig::one("prefix+shift+e"),
             indexed: IndexedKeysConfig::default(),
             command: Vec::new(),
