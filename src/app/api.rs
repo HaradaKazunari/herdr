@@ -7,6 +7,7 @@ mod integrations;
 mod layouts;
 mod panes;
 pub(crate) mod plugins;
+mod queue;
 mod responses;
 mod tabs;
 mod workspaces;
@@ -98,6 +99,24 @@ impl App {
         if let AppEvent::WorktreeRemoveFinished(result) = ev {
             self.handle_worktree_remove_finished(*result);
             return;
+        }
+
+        // The resident note terminal is not part of the workspace tab tree, so
+        // handle (and respawn) its death before the normal pane-death path.
+        if let AppEvent::PaneDied { pane_id } = &ev {
+            if self.handle_note_terminal_died(*pane_id) {
+                return;
+            }
+        }
+
+        // The queues-prompt editor terminal is likewise standalone: on exit,
+        // read its buffer back into the queue and return to the queues pane.
+        if let AppEvent::PaneDied { pane_id } = &ev {
+            if self.handle_prompt_editor_terminal_died(*pane_id) {
+                self.render_dirty.store(true, Ordering::Release);
+                self.render_notify.notify_one();
+                return;
+            }
         }
 
         if let AppEvent::PaneDied { pane_id } = &ev {
@@ -354,6 +373,30 @@ impl App {
         was_overlay_focused_in_tab: bool,
         tab_zoomed_before_exit: Option<bool>,
     ) {
+        // Queues-prompt editor: read the edited buffer back into the agent's queue
+        // before the temp file is cleaned up, then return focus to the queues pane.
+        if let Some(capture) = &overlay.prompt_capture {
+            match std::fs::read_to_string(&capture.file) {
+                Ok(raw) => {
+                    let text = raw.trim().to_string();
+                    self.state
+                        .commit_edited_prompt(&capture.key, capture.original.as_deref(), text);
+                }
+                Err(err) => {
+                    tracing::warn!(err = %err, "failed to read prompt editor buffer");
+                    self.state.toast = Some(crate::app::state::ToastNotification {
+                        kind: crate::app::state::ToastKind::NeedsAttention,
+                        title: "prompt not saved".to_string(),
+                        context: err.to_string(),
+                        position: None,
+                        target: None,
+                    });
+                }
+            }
+            self.state.persistent_pane_visible = true;
+            self.state.persistent_selected_agent = Some((capture.ws_idx, capture.pane_id));
+        }
+
         for temp_file in &overlay.temp_files {
             let _ = std::fs::remove_file(temp_file);
         }
@@ -382,7 +425,13 @@ impl App {
         tab.zoomed = overlay.previous_zoomed;
 
         if was_overlay_active && self.state.active == Some(overlay.ws_idx) {
-            self.state.mode = Mode::Terminal;
+            // Returning from a prompt editor lands back in the queues pane; any
+            // other overlay returns to the terminal it covered.
+            self.state.mode = if overlay.prompt_capture.is_some() {
+                Mode::Queues
+            } else {
+                Mode::Terminal
+            };
         }
     }
 
@@ -852,6 +901,9 @@ impl App {
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentExplain(target) => return self.handle_agent_explain(request.id, target),
             Method::AgentSend(params) => return self.handle_agent_send(request.id, params),
+            Method::QueueAdd(params) => return self.handle_queue_add(request.id, params),
+            Method::QueueList(params) => return self.handle_queue_list(request.id, params),
+            Method::QueuePop(params) => return self.handle_queue_pop(request.id, params),
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
             Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),
             Method::PaneMove(params) => return self.handle_pane_move(request.id, params),
@@ -1128,6 +1180,7 @@ mod tests {
                 previous_focus,
                 previous_zoomed,
                 temp_files: Vec::new(),
+                prompt_capture: None,
             },
         );
         app

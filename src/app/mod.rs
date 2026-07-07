@@ -8,7 +8,7 @@ pub(crate) mod actions;
 mod agent_resume;
 mod agents;
 mod api;
-mod api_helpers;
+pub(crate) mod api_helpers;
 mod config_io;
 mod creation;
 mod ids;
@@ -42,6 +42,14 @@ const PANE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(500);
 const COPY_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
 
+/// File edited by the always-resident note pane (`nvim`), tilde-expanded.
+const NOTE_FILE_PATH: &str = "~/workspace/NOTES.md";
+/// A note-terminal death within this window of (re)spawning counts as a fast
+/// death for crash-loop detection.
+const NOTE_FAST_DEATH_WINDOW: Duration = Duration::from_secs(2);
+/// After this many consecutive fast deaths, stop auto-respawning the note pane.
+const NOTE_MAX_FAST_DEATHS: u8 = 3;
+
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute, terminal,
@@ -71,6 +79,24 @@ pub(crate) struct OverlayPaneState {
     previous_focus: crate::layout::PaneId,
     previous_zoomed: bool,
     temp_files: Vec<std::path::PathBuf>,
+    /// When set, the overlay is a queues-prompt editor: on exit, the temp file's
+    /// contents are read back into the target agent's queue before cleanup.
+    prompt_capture: Option<PromptCaptureTarget>,
+}
+
+/// Where a queues-prompt editor overlay should commit its edited text on exit.
+#[derive(Debug, Clone)]
+pub(crate) struct PromptCaptureTarget {
+    pub ws_idx: usize,
+    pub pane_id: crate::layout::PaneId,
+    /// The queue key, snapshotted at launch so a session/cwd change mid-edit can't
+    /// redirect the write to a different queue.
+    pub key: String,
+    /// The prompt being edited, used to re-find it by content on exit (the index
+    /// can shift while the editor is open — idle auto-send keeps draining the
+    /// queue). `None` appends a new prompt.
+    pub original: Option<String>,
+    pub file: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -136,6 +162,14 @@ pub struct App {
     pub(crate) overlay_panes: HashMap<crate::layout::PaneId, OverlayPaneState>,
     pub(crate) local_terminal_notifications: bool,
     pub(crate) config_reloaded_from_disk: bool,
+    /// When the resident note terminal was last (re)spawned, for crash-loop
+    /// guarding. `None` until first spawned.
+    pub(crate) note_spawn_at: Option<Instant>,
+    /// Consecutive note-terminal deaths that occurred within
+    /// `NOTE_FAST_DEATH_WINDOW` of spawning. Resets on a long-lived session.
+    pub(crate) note_fast_deaths: u8,
+    /// Set once the note terminal has crash-looped; suppresses auto-respawn.
+    pub(crate) note_respawn_blocked: bool,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -357,6 +391,10 @@ impl App {
 
         // Try to restore previous session
         let mut restored_terminals = std::collections::HashMap::new();
+        let mut restored_agent_queues: std::collections::HashMap<
+            String,
+            std::collections::VecDeque<state::QueuedPrompt>,
+        > = std::collections::HashMap::new();
         let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
         let (
             workspaces,
@@ -396,6 +434,21 @@ impl App {
                 render_dirty.clone(),
             );
             restored_terminals = terminals;
+            // Restore next-prompt queues (keyed by stable agent id), reconstructing
+            // QueuedPrompt from the persisted plain text so they survive restart.
+            restored_agent_queues = snap
+                .agent_queues
+                .iter()
+                .map(|(key, texts)| {
+                    (
+                        key.clone(),
+                        texts
+                            .iter()
+                            .map(|text| state::QueuedPrompt { text: text.clone() })
+                            .collect(),
+                    )
+                })
+                .collect();
             restored_terminal_runtimes = terminal_runtimes.into();
             if ws.is_empty() {
                 crate::logging::session_restored(0, "empty");
@@ -562,6 +615,8 @@ impl App {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
+                persistent_pane_rect: Rect::default(),
+                note_pane_rect: Rect::default(),
             },
             drag: None,
             workspace_press: None,
@@ -644,6 +699,24 @@ impl App {
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            agent_queues: restored_agent_queues,
+            agent_autosend: std::collections::HashMap::new(),
+            persistent_pane_visible: true,
+            persistent_pane_width: 72,
+            persistent_pane_selected: 0,
+            persistent_selected_agent: None,
+            persistent_item_selected: None,
+            persistent_input: None,
+            request_queue_insert: Vec::new(),
+            request_prompt_editor: None,
+            note_terminal_id: None,
+            note_pane_id: crate::layout::PaneId::alloc(),
+            prompt_editor_terminal_id: None,
+            prompt_editor_pane_id: crate::layout::PaneId::alloc(),
+            prompt_editor_capture: None,
+            request_ensure_note: false,
+            pending_autosend: std::collections::HashMap::new(),
+            autosend_streak: std::collections::HashMap::new(),
         };
 
         state.terminals = restored_terminals;
@@ -727,6 +800,9 @@ impl App {
             overlay_panes: HashMap::new(),
             local_terminal_notifications: true,
             config_reloaded_from_disk: false,
+            note_spawn_at: None,
+            note_fast_deaths: 0,
+            note_respawn_blocked: false,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         }
     }
@@ -772,6 +848,19 @@ impl App {
         app.state.pane_id_aliases = pane_id_aliases;
         app.state.workspaces = workspaces;
         app.state.terminals = terminals;
+        app.state.agent_queues = snapshot
+            .agent_queues
+            .iter()
+            .map(|(key, texts)| {
+                (
+                    key.clone(),
+                    texts
+                        .iter()
+                        .map(|text| state::QueuedPrompt { text: text.clone() })
+                        .collect(),
+                )
+            })
+            .collect();
         app.terminal_runtimes = runtimes.into();
         app.state.active = snapshot
             .active
@@ -845,11 +934,136 @@ impl App {
         self.prefix_input_source = source;
     }
 
+    /// The nvim grid size for the note terminal, taken from the note pane's
+    /// rendered sub-rect. `None` until the first layout has placed the note pane,
+    /// so the spawn can wait for the real size instead of guessing.
+    fn note_spawn_size(&self) -> Option<(u16, u16)> {
+        let inner = crate::ui::note_inner_rect(self.state.view.note_pane_rect);
+        (inner.width > 0 && inner.height > 0).then_some((inner.height, inner.width))
+    }
+
+    /// Spawn the singleton, always-resident note terminal (`nvim ~/workspace/NOTES.md`)
+    /// if it is not already running. Idempotent and cheap to call repeatedly: it
+    /// returns early when the terminal is alive or auto-respawn is disabled. The
+    /// terminal lives only in the runtime registry, outside the workspace tab
+    /// tree, so it is shared across every workspace and tab. No-op until the note
+    /// pane has been laid out (see [`Self::note_spawn_size`]).
+    pub(crate) fn ensure_note_terminal(&mut self) {
+        if self.note_respawn_blocked {
+            return;
+        }
+        if let Some(id) = &self.state.note_terminal_id {
+            if self.terminal_runtimes.get(id).is_some() {
+                return;
+            }
+        }
+
+        let notes_path = crate::worktree::expand_tilde_absolute_path(NOTE_FILE_PATH);
+        // Run from the notes file's directory when it exists, else $HOME, else ".".
+        let cwd = notes_path
+            .parent()
+            .filter(|p| p.is_dir())
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let argv = vec!["nvim".to_string(), notes_path.to_string_lossy().into_owned()];
+        // Spawn nvim already sized to the note pane. Before the first layout the
+        // note rect is unknown; defer the spawn until then rather than starting at
+        // a wrong (wide) estimate and shrinking it — that one-time reflow is what
+        // corrupts the initial display until a manual `:q`/respawn.
+        let Some((rows, cols)) = self.note_spawn_size() else {
+            return;
+        };
+        let launch_env = crate::pane::PaneLaunchEnv::from_extra(Vec::new());
+        let pane_id = self.state.note_pane_id;
+
+        let runtime = match crate::terminal::TerminalRuntime::spawn_argv_command(
+            pane_id,
+            rows.max(2),
+            cols.max(4),
+            cwd,
+            &argv,
+            &launch_env,
+            self.state.pane_scrollback_limit_bytes,
+            self.state.host_terminal_theme,
+            self.event_tx.clone(),
+            self.render_notify.clone(),
+            self.render_dirty.clone(),
+        ) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                tracing::warn!(err = %err, "failed to spawn resident note terminal (nvim)");
+                self.state.note_terminal_id = None;
+                return;
+            }
+        };
+
+        let id = crate::terminal::TerminalId::alloc();
+        self.terminal_runtimes.insert(id.clone(), runtime);
+        self.state.note_terminal_id = Some(id);
+        self.note_spawn_at = Some(Instant::now());
+        self.render_dirty.store(true, Ordering::Release);
+        self.render_notify.notify_one();
+    }
+
+    /// React to a `PaneDied` for the note terminal: drop the dead runtime and
+    /// respawn it (crash-loop-guarded). Returns true if `pane_id` was the note
+    /// pane (so the caller can skip normal pane-death handling).
+    pub(crate) fn handle_note_terminal_died(&mut self, pane_id: crate::layout::PaneId) -> bool {
+        if self.state.note_terminal_id.is_none() || pane_id != self.state.note_pane_id {
+            return false;
+        }
+        if let Some(id) = self.state.note_terminal_id.take() {
+            if let Some(runtime) = self.terminal_runtimes.remove(&id) {
+                runtime.shutdown();
+            }
+        }
+
+        let fast_death = self
+            .note_spawn_at
+            .is_some_and(|at| at.elapsed() < NOTE_FAST_DEATH_WINDOW);
+        if fast_death {
+            self.note_fast_deaths = self.note_fast_deaths.saturating_add(1);
+            if self.note_fast_deaths >= NOTE_MAX_FAST_DEATHS {
+                self.note_respawn_blocked = true;
+                tracing::warn!("note terminal exited repeatedly; disabling auto-respawn");
+            }
+        } else {
+            self.note_fast_deaths = 0;
+        }
+
+        // If the user was editing the note, return them to a usable mode.
+        if self.state.mode == Mode::Note {
+            self.state.mode = if self.state.active.is_some() {
+                Mode::Terminal
+            } else {
+                Mode::Navigate
+            };
+        }
+
+        self.ensure_note_terminal();
+        self.render_dirty.store(true, Ordering::Release);
+        self.render_notify.notify_one();
+        true
+    }
+
+    /// Drain a user request to (re)open the note pane (set when the note pane is
+    /// focused): clear any crash-loop block and re-attempt a spawn, so a
+    /// transiently-broken note pane is always recoverable by re-focusing it.
+    pub(crate) fn drain_note_ensure_request(&mut self) {
+        if std::mem::take(&mut self.state.request_ensure_note) {
+            self.note_respawn_blocked = false;
+            self.note_fast_deaths = 0;
+            self.ensure_note_terminal();
+        }
+    }
+
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         if self.input_rx.is_none() {
             self.input_rx = Some(crate::raw_input::spawn_input_reader());
         }
         self.query_host_terminal_theme();
+        self.ensure_note_terminal();
 
         let mut needs_render = true;
         let mut host_mouse_capture_active = self.state.mouse_capture;
@@ -914,6 +1128,42 @@ impl App {
 
             if let Some(ws_idx) = self.state.request_remove_linked_worktree.take() {
                 self.open_remove_linked_worktree_confirmation(ws_idx);
+                needs_render = true;
+            }
+
+            self.drain_note_ensure_request();
+
+            // Queues pane: insert a queued prompt into the target agent's input
+            // (no Enter) so the user can review and send it themselves. Wrap in
+            // bracketed paste so embedded newlines are literal text, not an early
+            // submit. If delivery fails, put the prompt back so it is not lost.
+            for (ws_idx, pane_id, text, send_enter) in
+                std::mem::take(&mut self.state.request_queue_insert)
+            {
+                let sent = self
+                    .state
+                    .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+                    .map(|runtime| {
+                        // Bracketed paste keeps newlines literal; Enter (auto-send
+                        // only) goes OUTSIDE the paste so it submits, not inserts.
+                        let mut encoded = crate::app::api_helpers::encode_api_text(runtime, &text);
+                        if send_enter {
+                            encoded.push(b'\r');
+                        }
+                        runtime.try_send_bytes(bytes::Bytes::from(encoded)).is_ok()
+                    })
+                    .unwrap_or(false);
+                if !sent {
+                    let key = self.state.queue_key_for_pane(ws_idx, pane_id);
+                    self.state.requeue_prompt_front(key, text);
+                }
+                needs_render = true;
+            }
+
+            // Queues prompt: open it in an external editor (nvim) for IME-friendly
+            // composition; the result is captured when the editor exits.
+            if let Some(req) = self.state.request_prompt_editor.take() {
+                self.launch_queue_prompt_editor(req);
                 needs_render = true;
             }
 
@@ -996,6 +1246,9 @@ impl App {
                     self.render_dirty.store(true, Ordering::Release);
                     self.render_notify.notify_one();
                 }
+                // Now that the layout has placed the note pane, spawn nvim at its
+                // real size (no-op once running).
+                self.ensure_note_terminal();
                 self.last_render_at = Some(now);
                 needs_render = false;
                 continue;
@@ -1605,6 +1858,21 @@ impl App {
             }
             Mode::Resize => {
                 input::handle_resize_key(&mut self.state, key);
+            }
+            Mode::Queues => {
+                input::handle_queues_key(&mut self.state, key);
+            }
+            Mode::Spaces => {
+                input::handle_spaces_key(&mut self.state, key);
+            }
+            Mode::Agents => {
+                input::handle_agents_key(&mut self.state, key);
+            }
+            Mode::Note => {
+                self.handle_note_key(key);
+            }
+            Mode::PromptEditor => {
+                self.handle_prompt_editor_key(key);
             }
             Mode::ConfirmClose => {
                 input::handle_confirm_close_key(&mut self.state, key_event);

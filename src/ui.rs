@@ -12,6 +12,7 @@ mod mobile;
 mod navigator;
 mod onboarding;
 mod panes;
+mod persistent;
 mod release_notes;
 mod scrollbar;
 mod settings;
@@ -68,7 +69,7 @@ pub(crate) use self::{
         SETTINGS_POPUP_WIDTH,
     },
     sidebar::{
-        agent_panel_body_rect, agent_panel_entries, agent_panel_scroll_metrics,
+        agent_panel_body_rect, agent_panel_entries, agent_panel_layout, agent_panel_scroll_metrics,
         agent_panel_scrollbar_rect, agent_panel_toggle_rect, collapsed_sidebar_sections,
         collapsed_sidebar_toggle_rect, compute_workspace_card_areas, expanded_sidebar_sections,
         expanded_sidebar_toggle_rect, normalized_workspace_scroll, sidebar_section_divider_rect,
@@ -84,6 +85,7 @@ pub(crate) use self::{
         mobile_switcher_workspace_doc_range, MobileSwitcherTarget,
     },
     panes::{apply_pane_chrome, pane_inner_rect, pane_is_scrolled_back},
+    persistent::note_inner_rect,
     tabs::compute_tab_bar_view,
     widgets::{centered_popup_rect, modal_stack_areas},
 };
@@ -92,6 +94,10 @@ use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
 
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
+/// Minimum width the main column must retain for the persistent queues pane to
+/// be shown. On narrower terminals the pane is suppressed so the main content
+/// (and full-width banners like config diagnostics) is not cramped.
+const PERSISTENT_MIN_MAIN_WIDTH: u16 = 40;
 
 // Braille spinner frames — smooth rotation
 const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -187,8 +193,106 @@ fn compute_view_internal(
             .clamp(app.sidebar_min_width, app.sidebar_max_width)
     };
 
-    let [sidebar_area, main_area] =
-        Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(1)]).areas(area);
+    // F4: third top-level column — the persistent queues pane on the right.
+    // Suppressed when the terminal is too narrow to keep a usable main column.
+    let persistent_w = if app.persistent_pane_visible
+        && area
+            .width
+            .saturating_sub(sidebar_w)
+            .saturating_sub(app.persistent_pane_width)
+            >= PERSISTENT_MIN_MAIN_WIDTH
+    {
+        app.persistent_pane_width
+    } else {
+        0
+    };
+    let [sidebar_area, main_area, persistent_area] = Layout::horizontal([
+        Constraint::Length(sidebar_w),
+        Constraint::Min(1),
+        Constraint::Length(persistent_w),
+    ])
+    .areas(area);
+
+    // If the persistent column collapses (terminal too narrow), don't strand the
+    // user focused on an invisible note/queues pane — drop to a usable mode.
+    if resize_panes
+        && persistent_area.width == 0
+        && matches!(app.mode, Mode::Queues | Mode::Note | Mode::PromptEditor)
+    {
+        app.mode = if app.active.is_some() {
+            Mode::Terminal
+        } else {
+            Mode::Navigate
+        };
+    }
+
+    // Split the persistent column into the resident note pane (nvim) on top and
+    // the agent queues below. Empty (width 0) when the column is hidden/narrow.
+    let (note_area, queues_area) = if persistent_area.width >= 1 {
+        // note:queues = 3:2 (note on top).
+        let [note_area, queues_area] =
+            Layout::vertical([Constraint::Ratio(3, 5), Constraint::Ratio(2, 5)])
+                .areas(persistent_area);
+        (note_area, queues_area)
+    } else {
+        (Rect::default(), persistent_area)
+    };
+    // Keep the note PTY (nvim) sized to its rendered sub-rect (no-op-guarded).
+    if resize_panes {
+        if let Some(rt) = app
+            .note_terminal_id
+            .as_ref()
+            .and_then(|id| terminal_runtimes.get(id))
+        {
+            let inner = persistent::note_inner_rect(note_area);
+            if inner.width > 0 && inner.height > 0 {
+                rt.resize(inner.height, inner.width, cell_size.width_px, cell_size.height_px);
+            }
+        }
+        // Keep the transient prompt editor PTY sized to the queues sub-pane.
+        if let Some(rt) = app
+            .prompt_editor_terminal_id
+            .as_ref()
+            .and_then(|id| terminal_runtimes.get(id))
+        {
+            let inner = persistent::queues_inner_rect(queues_area);
+            if inner.width > 0 && inner.height > 0 {
+                rt.resize(inner.height, inner.width, cell_size.width_px, cell_size.height_px);
+            }
+        }
+    }
+
+    // While the queues pane is focused, resolve which concrete agent is selected.
+    // The order is stabilized by (ws_idx, pane_id) so a positional index stays
+    // meaningful frame-to-frame regardless of the sidebar's sort mode.
+    if app.mode == Mode::Queues {
+        let mut entries = sidebar::agent_panel_entries_from(app, terminal_runtimes);
+        entries.sort_by_key(|entry| (entry.ws_idx, entry.pane_id.raw()));
+        let ordered = persistent::ordered_agent_ids(&entries);
+        // While drilled into an agent (ItemNav or text entry), keep acting on
+        // that same agent by identity — follow its new position, or drop the
+        // drill if it vanished — so deletes/edits never hit the wrong queue.
+        let drilled = app.persistent_item_selected.is_some() || app.persistent_input.is_some();
+        let pinned_pos = drilled
+            .then(|| {
+                app.persistent_selected_agent
+                    .and_then(|target| ordered.iter().position(|id| *id == target))
+            })
+            .flatten();
+        match pinned_pos {
+            Some(pos) => app.persistent_pane_selected = pos,
+            None => {
+                if drilled {
+                    app.persistent_item_selected = None;
+                    app.persistent_input = None;
+                }
+                app.persistent_pane_selected = app
+                    .persistent_pane_selected
+                    .min(ordered.len().saturating_sub(1));
+                app.persistent_selected_agent = ordered.get(app.persistent_pane_selected).copied();
+            }
+        }
+    }
 
     let has_tabs = app.active.and_then(|i| app.workspaces.get(i)).is_some();
     let (tab_bar_rect, terminal_area) = if has_tabs && main_area.height > 1 {
@@ -288,6 +392,8 @@ fn compute_view_internal(
         toast_hit_area,
         pane_infos,
         split_borders,
+        persistent_pane_rect: queues_area,
+        note_pane_rect: note_area,
     };
 }
 
@@ -298,6 +404,16 @@ fn compute_mobile_view(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) {
+    // The persistent column (note + queues) is not drawn in the mobile layout;
+    // don't leave the user focused on an invisible pane.
+    if resize_panes && matches!(app.mode, Mode::Queues | Mode::Note | Mode::PromptEditor) {
+        app.mode = if app.active.is_some() {
+            Mode::Terminal
+        } else {
+            Mode::Navigate
+        };
+    }
+
     let header_h = area.height.min(2);
     let (header_rect, terminal_area) = if area.height > header_h {
         let [header_rect, terminal_area] =
@@ -363,6 +479,8 @@ fn compute_mobile_view(
         toast_hit_area,
         pane_infos,
         split_borders,
+        persistent_pane_rect: Rect::default(),
+        note_pane_rect: Rect::default(),
     };
 }
 
@@ -394,6 +512,18 @@ pub fn render_with_runtime_registry(
     }
     render_panes(app, terminal_runtimes, frame, terminal_area);
 
+    // F4: persistent column (right edge, all workspaces/tabs): resident note
+    // pane (nvim) on top, agent queues below.
+    if app.view.layout != ViewLayout::Mobile {
+        persistent::render_note_pane(app, terminal_runtimes, frame, app.view.note_pane_rect);
+        persistent::render_persistent_pane(
+            app,
+            terminal_runtimes,
+            frame,
+            app.view.persistent_pane_rect,
+        );
+    }
+
     // Ambient notifications sit above panes, but below interactive overlays.
     render_notifications(app, frame, terminal_area);
 
@@ -424,6 +554,15 @@ pub fn render_with_runtime_registry(
         Mode::GlobalMenu => render_global_launcher_menu(app, frame),
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
+        // The queues and note panes draw their own focus highlight in the
+        // persistent column; the spaces focus highlights the sidebar workspace
+        // list directly. No overlay is needed for any of them.
+        Mode::Queues => {}
+        Mode::Spaces => {}
+        Mode::Agents => {}
+        Mode::Note => {}
+        // The prompt editor draws inside the queues sub-pane; no overlay needed.
+        Mode::PromptEditor => {}
         Mode::Terminal => {}
     }
 }

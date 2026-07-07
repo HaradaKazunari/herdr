@@ -22,7 +22,7 @@ fn normalize_api_key_alias(key: &str) -> &str {
     }
 }
 
-pub(super) fn encode_api_text(runtime: &crate::terminal::TerminalRuntime, text: &str) -> Vec<u8> {
+pub(crate) fn encode_api_text(runtime: &crate::terminal::TerminalRuntime, text: &str) -> Vec<u8> {
     let bracketed = runtime
         .input_state()
         .map(|state| state.bracketed_paste)

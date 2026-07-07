@@ -22,6 +22,9 @@ pub(crate) struct AgentPanelEntry {
     pub pane_id: crate::layout::PaneId,
     pub primary_label: String,
     pub primary_tab_label: Option<String>,
+    /// The pane's tab name (custom name, else the tab number). Always present,
+    /// unlike `primary_tab_label` which is only set for multi-tab workspaces.
+    pub tab_label: String,
     pub agent_label: Option<String>,
     pub state: AgentState,
     pub seen: bool,
@@ -129,6 +132,7 @@ fn agent_panel_entries_with_runtimes(
                     tab_idx: detail.tab_idx,
                     pane_id: detail.pane_id,
                     primary_label: workspace_label.clone(),
+                    tab_label: detail.tab_label.clone(),
                     primary_tab_label: multi_tab.then_some(detail.tab_label),
                     agent_label: Some(detail.agent_label),
                     state: detail.state,
@@ -175,6 +179,18 @@ fn truncate_text(text: &str, max_width: usize) -> String {
     }
     let prefix: String = text.chars().take(max_width.saturating_sub(1)).collect();
     format!("{prefix}…")
+}
+
+/// Per-agent label used under a workspace header (grouped mode): the space is
+/// already shown by the header, so drop it and show the pane identity — the tab
+/// label for a multi-tab workspace, otherwise the agent name.
+fn agent_panel_grouped_label(entry: &AgentPanelEntry, max_width: usize) -> String {
+    let name = entry
+        .primary_tab_label
+        .as_deref()
+        .or(entry.agent_label.as_deref())
+        .unwrap_or("agent");
+    truncate_text(name, max_width)
 }
 
 fn format_agent_panel_primary_label(entry: &AgentPanelEntry, max_width: usize) -> String {
@@ -506,27 +522,89 @@ pub(crate) fn agent_panel_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
     Rect::new(area.x, body_y, body_width, body_height)
 }
 
-fn agent_panel_visible_count(area: Rect) -> usize {
-    let body = agent_panel_body_rect(area, false);
+/// One agent's placement in the agents-panel body: the entry it draws, the
+/// optional workspace header rendered above it (grouped mode, at a space
+/// boundary or the first visible row, for context), and the rows its name and
+/// status lines occupy. Shared by the renderer, the scroll metrics, and click
+/// hit-testing so all three agree on row positions.
+pub(crate) struct AgentPanelRow {
+    pub entry_index: usize,
+    pub header: Option<String>,
+    pub name_y: u16,
+    pub status_y: u16,
+}
+
+/// Lay out the agents that fit in `body` starting at entry `start`, mirroring the
+/// render walk: an optional 1-row workspace header, a name row, a status row, and
+/// a 1-row separator when there is room. In `Spaces` sort a header precedes the
+/// first agent of each contiguous workspace group (and the first visible agent,
+/// so a mid-group scroll still shows which space it belongs to); in `Priority`
+/// sort the list stays flat with no headers.
+pub(crate) fn agent_panel_layout(
+    app: &AppState,
+    body: Rect,
+    entries: &[AgentPanelEntry],
+    start: usize,
+) -> Vec<AgentPanelRow> {
+    let mut rows = Vec::new();
     if body.width == 0 || body.height < 2 {
-        return 0;
+        return rows;
     }
 
-    let mut used_rows = 0u16;
-    let mut visible = 0usize;
-    while used_rows.saturating_add(2) <= body.height {
-        used_rows = used_rows.saturating_add(2);
-        visible += 1;
-        if used_rows < body.height {
-            used_rows = used_rows.saturating_add(1);
+    let grouped = matches!(app.agent_panel_sort, AgentPanelSort::Spaces);
+    let body_bottom = body.y + body.height;
+    let mut row_y = body.y;
+    let mut prev_ws: Option<usize> = None;
+    for (entry_index, entry) in entries.iter().enumerate().skip(start) {
+        let header =
+            (grouped && prev_ws != Some(entry.ws_idx)).then(|| entry.primary_label.clone());
+        prev_ws = Some(entry.ws_idx);
+        let header_rows = u16::from(header.is_some());
+
+        // The header (when present), name row, and status row must all fit.
+        if row_y.saturating_add(header_rows).saturating_add(1) >= body_bottom {
+            break;
+        }
+        let name_y = row_y + header_rows;
+        let status_y = name_y + 1;
+        rows.push(AgentPanelRow {
+            entry_index,
+            header,
+            name_y,
+            status_y,
+        });
+
+        row_y = status_y + 1;
+        if row_y < body_bottom {
+            row_y = row_y.saturating_add(1); // blank separator between agents
         }
     }
-    visible
+    rows
+}
+
+/// The largest number of trailing agents that fit when the list is anchored to
+/// the bottom. Used as the viewport size so the scroll clamp always leaves the
+/// final agent reachable — grouped-mode headers make per-window heights vary, so
+/// a fixed count would otherwise push the last agents off-screen.
+fn agent_panel_bottom_capacity(app: &AppState, body: Rect, entries: &[AgentPanelEntry]) -> usize {
+    let total = entries.len();
+    let mut capacity = 0usize;
+    while capacity < total {
+        let next = capacity + 1;
+        if agent_panel_layout(app, body, entries, total - next).len() == next {
+            capacity = next;
+        } else {
+            break;
+        }
+    }
+    capacity
 }
 
 pub(crate) fn agent_panel_scroll_metrics(app: &AppState, area: Rect) -> crate::pane::ScrollMetrics {
-    let viewport_rows = agent_panel_visible_count(area);
-    let total_rows = agent_panel_entries(app).len();
+    let body = agent_panel_body_rect(area, false);
+    let entries = agent_panel_entries(app);
+    let total_rows = entries.len();
+    let viewport_rows = agent_panel_bottom_capacity(app, body, &entries);
     let max_offset_from_bottom = total_rows.saturating_sub(viewport_rows);
     let offset_from_bottom = total_rows
         .saturating_sub(app.agent_panel_scroll)
@@ -785,7 +863,9 @@ pub(super) fn render_sidebar(
 ) {
     let p = &app.palette;
     let is_navigating = matches!(app.mode, Mode::Navigate);
-    let sep_style = if is_navigating {
+    let spaces_focused = matches!(app.mode, Mode::Spaces);
+    let agents_focused = matches!(app.mode, Mode::Agents);
+    let sep_style = if is_navigating || spaces_focused || agents_focused {
         Style::default().fg(p.accent)
     } else {
         Style::default().fg(p.surface_dim)
@@ -800,7 +880,13 @@ pub(super) fn render_sidebar(
 
     let (ws_area, detail_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
 
-    render_workspace_list(app, terminal_runtimes, frame, ws_area, is_navigating);
+    render_workspace_list(
+        app,
+        terminal_runtimes,
+        frame,
+        ws_area,
+        is_navigating || spaces_focused,
+    );
     render_agent_detail(app, terminal_runtimes, frame, detail_area);
     render_sidebar_toggle(app, frame, area, false, p);
 }
@@ -829,11 +915,15 @@ fn render_workspace_list(
 
     let list_bottom = area.y + area.height.saturating_sub(1);
     if area.height > 0 {
+        // Highlight the header while the space list itself is focused (Mode::Spaces),
+        // mirroring the focused-title cue used by the queues and note panes.
+        let header_style = if matches!(app.mode, Mode::Spaces) {
+            Style::default().fg(p.mauve).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD)
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(vec![Span::styled(
-                " spaces",
-                Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
-            )])),
+            Paragraph::new(Line::from(vec![Span::styled(" spaces", header_style)])),
             Rect::new(area.x, area.y, area.width, 1),
         );
     }
@@ -1028,11 +1118,15 @@ fn render_agent_detail(
         Rect::new(area.x, area.y, area.width, 1),
     );
 
+    // Highlight the header while the agents panel is focused (Mode::Agents),
+    // mirroring the focused-title cue used by the queues, note and space panes.
+    let agents_header_style = if matches!(app.mode, Mode::Agents) {
+        Style::default().fg(p.mauve).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD)
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled(
-            " agents",
-            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
-        )])),
+        Paragraph::new(Line::from(vec![Span::styled(" agents", agents_header_style)])),
         Rect::new(area.x, area.y + 1, area.width, 1),
     );
     let toggle_rect = agent_panel_toggle_rect(area, app.agent_panel_sort);
@@ -1055,11 +1149,22 @@ fn render_agent_detail(
         return;
     }
 
-    let mut row_y = body.y;
-    let body_bottom = body.y + body.height;
-    for detail in details.iter().skip(app.agent_panel_scroll) {
-        if row_y.saturating_add(1) >= body_bottom {
-            break;
+    let grouped = matches!(app.agent_panel_sort, AgentPanelSort::Spaces);
+    for row in agent_panel_layout(app, body, &details, app.agent_panel_scroll) {
+        let detail = &details[row.entry_index];
+
+        // Workspace header, drawn once per contiguous space group (grouped mode).
+        if let Some(ws_label) = &row.header {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(
+                        " {}",
+                        truncate_text(ws_label, body.width.saturating_sub(1) as usize)
+                    ),
+                    Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+                ))),
+                Rect::new(body.x, row.name_y.saturating_sub(1), body.width, 1),
+            );
         }
 
         // Check if this agent entry corresponds to the active session
@@ -1091,8 +1196,11 @@ fn render_agent_detail(
         };
         let agent_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
 
-        let primary_label =
-            format_agent_panel_primary_label(detail, body.width.saturating_sub(3) as usize);
+        let primary_label = if grouped {
+            agent_panel_grouped_label(detail, body.width.saturating_sub(3) as usize)
+        } else {
+            format_agent_panel_primary_label(detail, body.width.saturating_sub(3) as usize)
+        };
         let name_line = Line::from(vec![
             Span::styled(" ", Style::default()),
             Span::styled(icon, icon_style),
@@ -1101,17 +1209,21 @@ fn render_agent_detail(
         ]);
         frame.render_widget(
             Paragraph::new(name_line).style(row_style),
-            Rect::new(body.x, row_y, body.width, 1),
+            Rect::new(body.x, row.name_y, body.width, 1),
         );
-        row_y += 1;
 
         let mut status_spans = vec![
             Span::styled("   ", Style::default()),
             Span::styled(label, status_style),
         ];
-        if let Some(agent_label) = &detail.agent_label {
-            status_spans.push(Span::styled(" · ", agent_style));
-            status_spans.push(Span::styled(agent_label, agent_style));
+        // In grouped mode the name row already shows the agent name when there is
+        // no tab label, so suppress the redundant agent name in the status row.
+        let show_status_agent = !grouped || detail.primary_tab_label.is_some();
+        if show_status_agent {
+            if let Some(agent_label) = &detail.agent_label {
+                status_spans.push(Span::styled(" · ", agent_style));
+                status_spans.push(Span::styled(agent_label, agent_style));
+            }
         }
         if let Some(custom_status) = &detail.custom_status {
             status_spans.push(Span::styled(" · ", agent_style));
@@ -1119,13 +1231,8 @@ fn render_agent_detail(
         }
         frame.render_widget(
             Paragraph::new(Line::from(status_spans)).style(row_style),
-            Rect::new(body.x, row_y, body.width, 1),
+            Rect::new(body.x, row.status_y, body.width, 1),
         );
-        row_y += 1;
-
-        if row_y < body_bottom {
-            row_y += 1;
-        }
     }
 
     if let Some(track) = scrollbar_rect {
@@ -1395,6 +1502,7 @@ mod tests {
             pane_id: crate::layout::PaneId::from_raw(1),
             primary_label: "agent-browser".into(),
             primary_tab_label: Some("test-escalation".into()),
+            tab_label: "test-escalation".into(),
             agent_label: Some("claude".into()),
             state: AgentState::Idle,
             seen: true,
@@ -1414,6 +1522,76 @@ mod tests {
 
         assert_eq!(ws_area, Rect::new(0, 0, 19, 3));
         assert_eq!(detail_area, Rect::new(0, 3, 19, 2));
+    }
+
+    fn layout_entry(ws_idx: usize, ws_label: &str, pane: u32) -> AgentPanelEntry {
+        AgentPanelEntry {
+            ws_idx,
+            tab_idx: 0,
+            pane_id: crate::layout::PaneId::from_raw(pane),
+            primary_label: ws_label.to_string(),
+            primary_tab_label: None,
+            tab_label: "1".to_string(),
+            agent_label: Some("claude".to_string()),
+            state: AgentState::Idle,
+            seen: true,
+            last_agent_state_change_seq: None,
+            custom_status: None,
+            state_labels: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn agent_panel_layout_groups_contiguous_spaces_under_one_header() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.agent_panel_sort = AgentPanelSort::Spaces;
+        let entries = vec![
+            layout_entry(0, "alpha", 1),
+            layout_entry(0, "alpha", 2),
+            layout_entry(1, "beta", 3),
+        ];
+        let rows = agent_panel_layout(&app, Rect::new(0, 0, 30, 24), &entries, 0);
+
+        assert_eq!(rows.len(), 3);
+        // First agent of each space gets a header; the second alpha agent does not.
+        assert_eq!(rows[0].header.as_deref(), Some("alpha"));
+        assert_eq!(rows[1].header, None);
+        assert_eq!(rows[2].header.as_deref(), Some("beta"));
+        // The header sits on the row directly above the agent's name row.
+        assert_eq!(rows[0].name_y, 1);
+        assert_eq!(rows[2].name_y, rows[2].status_y - 1);
+    }
+
+    #[test]
+    fn agent_panel_layout_stays_flat_in_priority_mode() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.agent_panel_sort = AgentPanelSort::Priority;
+        let entries = vec![
+            layout_entry(0, "alpha", 1),
+            layout_entry(1, "beta", 2),
+        ];
+        let rows = agent_panel_layout(&app, Rect::new(0, 0, 30, 24), &entries, 0);
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.header.is_none()));
+        assert_eq!(rows[0].name_y, 0);
+    }
+
+    #[test]
+    fn agent_panel_layout_shows_space_header_for_first_visible_when_scrolled_mid_group() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.agent_panel_sort = AgentPanelSort::Spaces;
+        let entries = vec![
+            layout_entry(0, "alpha", 1),
+            layout_entry(0, "alpha", 2),
+        ];
+        // Scrolled past the first alpha agent: the top visible agent still shows
+        // which space it belongs to.
+        let rows = agent_panel_layout(&app, Rect::new(0, 0, 30, 24), &entries, 1);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entry_index, 1);
+        assert_eq!(rows[0].header.as_deref(), Some("alpha"));
     }
 
     #[test]

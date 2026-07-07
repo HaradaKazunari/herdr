@@ -571,6 +571,9 @@ fn restore_terminal_state(
 
 #[cfg(not(windows))]
 fn push_keyboard_enhancement_flags() -> io::Result<()> {
+    if crate::input::keyboard_enhancement_disabled() {
+        return Ok(());
+    }
     execute!(
         io::stdout(),
         PushKeyboardEnhancementFlags(crate::input::ime_compatible_keyboard_enhancement_flags())
@@ -584,6 +587,9 @@ fn push_keyboard_enhancement_flags() -> io::Result<()> {
 
 #[cfg(not(windows))]
 fn pop_keyboard_enhancement_flags() -> io::Result<()> {
+    if crate::input::keyboard_enhancement_disabled() {
+        return Ok(());
+    }
     execute!(io::stdout(), PopKeyboardEnhancementFlags)
 }
 

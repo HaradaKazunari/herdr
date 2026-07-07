@@ -46,8 +46,9 @@ mod terminal;
 pub(crate) use self::{
     modal::{
         handle_confirm_close_key, handle_context_menu_key, handle_global_menu_key,
-        handle_keybind_help_key, handle_navigator_key, handle_rename_key, handle_resize_key,
-        insert_navigator_search_text, insert_rename_input_text,
+        handle_agents_key, handle_keybind_help_key, handle_navigator_key, handle_queues_key,
+        handle_rename_key, handle_resize_key, handle_spaces_key, insert_navigator_search_text,
+        insert_rename_input_text,
     },
     navigate::terminal_direct_navigation_action,
     settings::open_settings_at,
@@ -92,6 +93,11 @@ impl App {
                 Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
                 Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
                 Mode::Resize => handle_resize_key(&mut self.state, key),
+                Mode::Queues => handle_queues_key(&mut self.state, key),
+                Mode::Spaces => handle_spaces_key(&mut self.state, key),
+                Mode::Agents => handle_agents_key(&mut self.state, key),
+                Mode::Note => self.handle_note_key(key),
+                Mode::PromptEditor => self.handle_prompt_editor_key(key),
                 Mode::ConfirmClose => handle_confirm_close_key(&mut self.state, key_event),
                 Mode::ContextMenu => {
                     handle_context_menu_key(
@@ -112,17 +118,44 @@ impl App {
     }
 
     pub(super) async fn handle_paste(&mut self, text: String) {
-        if self.state.mode != Mode::Terminal {
-            self.paste_into_active_text_input(&text);
-            return;
-        }
-
-        if let Some(ws_idx) = self.state.active {
-            if let Some(rt) = self
-                .state
-                .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
-            {
-                let _ = rt.send_paste(text).await;
+        match self.state.mode {
+            Mode::Terminal => {
+                if let Some(ws_idx) = self.state.active {
+                    if let Some(rt) = self
+                        .state
+                        .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
+                    {
+                        let _ = rt.send_paste(text).await;
+                    }
+                }
+            }
+            // The note pane is a live nvim terminal: forward pastes to its PTY —
+            // including IME commits (e.g. SKK) that some terminals deliver as a
+            // bracketed paste rather than individual key events.
+            Mode::Note => {
+                if let Some(rt) = self
+                    .state
+                    .note_terminal_id
+                    .clone()
+                    .and_then(|id| self.terminal_runtimes.get(&id))
+                {
+                    let _ = rt.send_paste(text).await;
+                }
+            }
+            // The prompt editor is a live nvim terminal too: forward pastes
+            // (including bracketed IME commits) straight to its PTY.
+            Mode::PromptEditor => {
+                if let Some(rt) = self
+                    .state
+                    .prompt_editor_terminal_id
+                    .clone()
+                    .and_then(|id| self.terminal_runtimes.get(&id))
+                {
+                    let _ = rt.send_paste(text).await;
+                }
+            }
+            _ => {
+                self.paste_into_active_text_input(&text);
             }
         }
     }
@@ -154,6 +187,13 @@ impl App {
                     return false;
                 }
                 insert_navigator_search_text(&mut self.state, &self.terminal_runtimes, text);
+                true
+            }
+            Mode::Queues => {
+                let Some(input) = self.state.persistent_input.as_mut() else {
+                    return false;
+                };
+                input.insert_str(text);
                 true
             }
             _ => false,
@@ -464,6 +504,8 @@ pub(crate) fn modal_paste_target_active(state: &AppState) -> bool {
             .as_ref()
             .is_some_and(|open| open.search_focused),
         Mode::Navigator => state.navigator.search_focused,
+        // Only while the queues prompt buffer is open for text entry.
+        Mode::Queues => state.persistent_input.is_some(),
         _ => false,
     }
 }
@@ -593,6 +635,7 @@ fn capture_snapshot(state: &AppState) -> crate::persist::SessionSnapshot {
         state.sidebar_width,
         state.sidebar_section_split,
         state.collapsed_space_keys.clone(),
+        std::collections::HashMap::new(),
     )
 }
 

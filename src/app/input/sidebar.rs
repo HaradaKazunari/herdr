@@ -467,20 +467,12 @@ impl AppState {
             return None;
         }
 
-        let mut row_y = body.y;
-        for detail in crate::ui::agent_panel_entries(self)
-            .into_iter()
-            .skip(self.agent_panel_scroll)
+        let entries = crate::ui::agent_panel_entries(self);
+        for placement in crate::ui::agent_panel_layout(self, body, &entries, self.agent_panel_scroll)
         {
-            if row_y.saturating_add(1) >= body.y + body.height {
-                break;
-            }
-            if row == row_y || row == row_y + 1 {
+            if row == placement.name_y || row == placement.status_y {
+                let detail = &entries[placement.entry_index];
                 return Some((detail.ws_idx, detail.tab_idx, detail.pane_id));
-            }
-            row_y = row_y.saturating_add(2);
-            if row_y < body.y + body.height {
-                row_y = row_y.saturating_add(1);
             }
         }
         None
@@ -694,7 +686,9 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 16));
+        // Row 17: grouped mode (the default) draws the "test" space header above
+        // the agents, so the second agent's row sits one below the old position.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 17));
 
         assert_eq!(app.state.workspaces[0].active_tab, 1);
         assert_eq!(
@@ -769,10 +763,13 @@ mod tests {
             app.state.view.sidebar_rect,
             app.state.sidebar_section_split,
         );
+        // Each workspace is its own space group, so grouped mode (the default)
+        // draws a header above each agent; the second workspace's agent row sits
+        // two below the old flat position (two headers precede it).
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             detail_area.x + 2,
-            detail_area.y + 6,
+            detail_area.y + 8,
         ));
 
         assert_eq!(app.state.active, Some(1));
@@ -889,10 +886,12 @@ mod tests {
 
         let detail_area = app.state.agent_panel_rect();
         let body = crate::ui::agent_panel_body_rect(detail_area, true);
+        // body.y is the grouped "test" space header (shown for context even when
+        // scrolled mid-group); the first visible agent's row is one below it.
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             body.x + 1,
-            body.y,
+            body.y + 1,
         ));
 
         assert_eq!(app.state.workspaces[0].active_tab, second_tab);
